@@ -34,7 +34,11 @@ class MobileUser(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     devices = relationship("MobileDevice", back_populates="mobile_user")
-    sessions = relationship("MobileSession", back_populates="mobile_user")
+    sessions = relationship(
+        "MobileSession",
+        foreign_keys="MobileSession.mobile_user_id",
+        back_populates="mobile_user",
+    )
     push_tokens = relationship("PushToken", back_populates="mobile_user")
 
     __table_args__ = (
