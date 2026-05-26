@@ -3,12 +3,8 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 python-dotenv
-passlib[bcrypt]
 python-jose[cryptography]
 python-multipart
 pydantic[email]
-pytesseract==0.3.10
-Pillow==10.0.0
 requests
-pdfminer.six
-docx2txt
+alembic

@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
-from routes.auth import router as auth_router
+load_dotenv()
+
 from routes.mobile_v1 import router as mobile_v1_router
-from routes.scan import router as scan_router
 
 app = FastAPI(
     title="ScanAI Backend",
@@ -33,6 +34,4 @@ def health():
     return {"status": "ok"}
 
 
-app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
-app.include_router(scan_router, prefix="/api/scan", tags=["scan"])
 app.include_router(mobile_v1_router, prefix="/api/v1", tags=["mobile-v1"])
