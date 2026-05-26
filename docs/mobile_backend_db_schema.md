@@ -12,7 +12,6 @@ Mobile Backend DB хранит только мобильную инфрастр�
 
 Mobile Backend DB хранит:
 
-- мобильные профили-связки с `core_user_id`;
 - устройства;
 - сессии и refresh-токены;
 - push-токены;
@@ -84,6 +83,8 @@ Redis хранит только краткоживущие и чувствите
 Локальная мобильная связка с пользователем из Oysyn Core.
 
 Поля: `id`, `core_user_id`, `core_organization_id`, `phone`, `email`, `full_name`, `role_snapshot`, `status`, `last_synced_at`, `created_at`, `updated_at`.
+
+Важно: login flow не должен создавать полноценного пользователя в mobile DB. Данные пользователя для авторизации и отображения имени приходят из Oysyn Core API. Любой локальный `mobile_users` record может использоваться только как техническая связка/кэш мобильной инфраструктуры, если конкретная mobile-функция требует локального состояния. Источник истины всегда Core.
 
 Индексы: `core_user_id`, `core_organization_id`, `phone`, `email`, `status`, `created_at`.
 

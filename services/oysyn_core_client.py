@@ -111,6 +111,14 @@ class OysynCoreClient:
         response = self._request("GET", "/checks", user_id=user_id, params=params)
         return self._json(response)
 
+    def get_organization(self, user_id: int, organization_id: int) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}",
+            user_id=user_id,
+        )
+        return self._json(response)
+
     async def create_check(
         self,
         user_id: int,
