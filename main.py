@@ -28,6 +28,11 @@ def read_root():
     return {"status": "ok", "app": "scanai-backend"}
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(scan_router, prefix="/api/scan", tags=["scan"])
 app.include_router(mobile_v1_router, prefix="/api/v1", tags=["mobile-v1"])
