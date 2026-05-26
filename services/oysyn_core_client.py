@@ -10,9 +10,19 @@ load_dotenv()
 
 class OysynCoreClient:
     def __init__(self) -> None:
-        self.base_url = os.getenv("OYSYN_INTERNAL_API_BASE_URL", "").rstrip("/")
-        self.secret = os.getenv("MOBILE_BACKEND_SECRET")
-        self.timeout = float(os.getenv("OYSYN_INTERNAL_API_TIMEOUT", "30"))
+        self.base_url = (
+            os.getenv("OYSYN_CORE_API_URL")
+            or os.getenv("OYSYN_INTERNAL_API_BASE_URL")
+            or ""
+        ).rstrip("/")
+        self.secret = (
+            os.getenv("OYSYN_CORE_SERVICE_TOKEN")
+            or os.getenv("MOBILE_BACKEND_SECRET")
+        )
+        self.timeout = float(
+            os.getenv("OYSYN_CORE_API_TIMEOUT")
+            or os.getenv("OYSYN_INTERNAL_API_TIMEOUT", "30")
+        )
 
     def _ensure_configured(self) -> None:
         if not self.base_url or not self.secret:

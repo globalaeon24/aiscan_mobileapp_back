@@ -109,6 +109,8 @@ Redis хранит только краткоживущие и чувствите
 
 Индексы: `mobile_user_id`, `device_id`, `status`, `refresh_token_hash`, `expires_at`, `created_at`.
 
+После успешного Core login Mobile Backend создает собственные mobile `access_token` и `refresh_token`. В PostgreSQL хранится только `refresh_token_hash`; raw refresh token возвращается клиенту один раз и не хранится в открытом виде.
+
 ### qr_login_sessions
 
 QR-авторизация web-сессии через мобильное приложение.

@@ -1,4 +1,6 @@
 import os
+import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -16,16 +18,20 @@ from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
 
+from database import get_db
+from mobile_models import MobileDevice, MobileSession, MobileUser
 from services.oysyn_core_client import oysyn_core_client
 
 router = APIRouter()
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("JWT_ALGORITHM") or os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 
 ALLOWED_REPORT_TYPES = {
     "full_report",
@@ -38,10 +44,19 @@ ALLOWED_REPORT_TYPES = {
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    device_id: Optional[str] = None
+    platform: Optional[str] = None
+    device_name: Optional[str] = None
+    device_model: Optional[str] = None
+    os_version: Optional[str] = None
+    app_version: Optional[str] = None
+    push_token: Optional[str] = None
+    push_provider: Optional[str] = None
 
 
 class MobileToken(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
     user: dict
 
@@ -68,8 +83,109 @@ def create_mobile_access_token(user_id: int) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=ACCESS_TOKEN_EXPIRE_MINUTES
     )
-    payload = {"sub": str(user_id), "exp": expire, "scope": "mobile"}
+    payload = {
+        "sub": str(user_id),
+        "exp": expire,
+        "scope": "mobile",
+        "jti": secrets.token_urlsafe(24),
+    }
     return jwt.encode(payload, secret_key, algorithm=ALGORITHM)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _sync_mobile_user(db: Session, user: dict) -> MobileUser:
+    core_user_id = str(user["id"])
+    mobile_user = (
+        db.query(MobileUser)
+        .filter(MobileUser.core_user_id == core_user_id)
+        .first()
+    )
+    if not mobile_user:
+        mobile_user = MobileUser(core_user_id=core_user_id)
+        db.add(mobile_user)
+
+    mobile_user.core_organization_id = (
+        str(user["organization_id"]) if user.get("organization_id") is not None else None
+    )
+    mobile_user.phone = user.get("phone_number") or user.get("phone")
+    mobile_user.email = user.get("email")
+    mobile_user.full_name = user.get("full_name") or " ".join(
+        part for part in [
+            user.get("last_name"),
+            user.get("first_name"),
+            user.get("middle_name"),
+        ]
+        if part
+    ) or None
+    mobile_user.role_snapshot = {
+        "role": user.get("role"),
+        "checks_available": user.get("checks_available"),
+        "organization_name": user.get("organization_name"),
+        "city": user.get("city"),
+    }
+    mobile_user.status = "active"
+    mobile_user.last_synced_at = datetime.now(timezone.utc)
+    return mobile_user
+
+
+def _sync_mobile_device(
+    db: Session,
+    mobile_user: MobileUser,
+    data: LoginRequest,
+) -> MobileDevice:
+    device_id = data.device_id or f"unknown:{mobile_user.core_user_id}"
+    device = (
+        db.query(MobileDevice)
+        .filter(
+            MobileDevice.mobile_user_id == mobile_user.id,
+            MobileDevice.device_id == device_id,
+        )
+        .first()
+    )
+    if not device:
+        device = MobileDevice(
+            mobile_user_id=mobile_user.id,
+            device_id=device_id,
+            platform=data.platform or "unknown",
+        )
+        db.add(device)
+
+    device.platform = data.platform or device.platform or "unknown"
+    device.device_name = data.device_name
+    device.device_model = data.device_model
+    device.os_version = data.os_version
+    device.app_version = data.app_version
+    device.push_token = data.push_token
+    device.push_provider = data.push_provider
+    device.is_active = True
+    device.last_seen_at = datetime.now(timezone.utc)
+    device.revoked_at = None
+    return device
+
+
+def _create_mobile_session(
+    db: Session,
+    mobile_user: MobileUser,
+    device: MobileDevice,
+    access_token: str,
+    refresh_token: str,
+) -> MobileSession:
+    payload = jwt.decode(access_token, _ensure_secret_key(), algorithms=[ALGORITHM])
+    session = MobileSession(
+        mobile_user_id=mobile_user.id,
+        device_id=device.device_id,
+        access_token_jti=payload.get("jti"),
+        refresh_token_hash=_hash_token(refresh_token),
+        status="active",
+        created_at=datetime.now(timezone.utc),
+        last_used_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    db.add(session)
+    return session
 
 
 def get_mobile_user_id(token: Optional[str] = Depends(oauth2_scheme)) -> int:
@@ -87,7 +203,7 @@ def get_mobile_user_id(token: Optional[str] = Depends(oauth2_scheme)) -> int:
 
 
 @router.post("/auth/login", response_model=MobileToken)
-def login(data: LoginRequest) -> MobileToken:
+def login(data: LoginRequest, db: Session = Depends(get_db)) -> MobileToken:
     core_response = oysyn_core_client.login(data.email, data.password)
     user = core_response.get("user") if isinstance(core_response, dict) else None
 
@@ -97,8 +213,19 @@ def login(data: LoginRequest) -> MobileToken:
             detail="Oysyn Core API returned login response without user id",
         )
 
+    access_token = create_mobile_access_token(int(user["id"]))
+    refresh_token = secrets.token_urlsafe(48)
+
+    mobile_user = _sync_mobile_user(db, user)
+    db.flush()
+    mobile_device = _sync_mobile_device(db, mobile_user, data)
+    db.flush()
+    _create_mobile_session(db, mobile_user, mobile_device, access_token, refresh_token)
+    db.commit()
+
     return MobileToken(
-        access_token=create_mobile_access_token(int(user["id"])),
+        access_token=access_token,
+        refresh_token=refresh_token,
         user=user,
     )
 
