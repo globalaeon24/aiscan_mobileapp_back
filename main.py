@@ -1,9 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from database import engine, Base
-from models import User, Organization, ScanResult
 
 from routes.auth import router as auth_router
+from routes.mobile_v1 import router as mobile_v1_router
 from routes.scan import router as scan_router
 
 app = FastAPI(
@@ -12,7 +11,7 @@ app = FastAPI(
     docs_url="/api/docs",           
     openapi_url="/api/openapi.json" 
 )
-Base.metadata.create_all(bind=engine)
+
 # На первом этапе оставим CORS максимально открытым,
 # потом можно будет сузить под домен/приложение.
 app.add_middleware(
@@ -31,3 +30,4 @@ def read_root():
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(scan_router, prefix="/api/scan", tags=["scan"])
+app.include_router(mobile_v1_router, prefix="/api/v1", tags=["mobile-v1"])
