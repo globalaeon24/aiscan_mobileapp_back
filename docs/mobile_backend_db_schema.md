@@ -1,8 +1,20 @@
 # Mobile Backend DB Schema
 
+Актуально на 2026-06-01.
+
 ## Правило поддержки схемы
 
 При любом изменении SQLAlchemy-моделей, Alembic-миграций или структуры таблиц необходимо обновлять этот документ. Документ является актуальной картой mobile backend БД и должен соответствовать фактической схеме PostgreSQL.
+
+## Текущий runtime статус
+
+SQLAlchemy-модели и Alembic-миграции для mobile DB уже созданы. При этом текущие публичные endpoints в `routes/mobile_v1.py` в основном работают как proxy к Oysyn Core Internal API и пока почти не используют эти таблицы.
+
+Это осознанное промежуточное состояние:
+
+- Core остается source of truth по пользователям, организациям, ролям, проверкам и отчетам;
+- mobile DB подготовлена под sessions/devices/QR/2FA/push/audit/mobile-specific state;
+- при добавлении refresh/logout, device tracking, QR-login, 2FA, push и notifications нужно использовать эту схему, а не создавать параллельные таблицы.
 
 ## Назначение mobile backend БД
 
@@ -110,7 +122,9 @@ Redis хранит только краткоживущие и чувствите
 
 Индексы: `mobile_user_id`, `device_id`, `status`, `refresh_token_hash`, `expires_at`, `created_at`.
 
-После успешного Core login Mobile Backend создает собственные mobile `access_token` и `refresh_token`. В PostgreSQL хранится только `refresh_token_hash`; raw refresh token возвращается клиенту один раз и не хранится в открытом виде.
+Целевое поведение: после успешного Core login Mobile Backend создает собственные mobile `access_token` и `refresh_token`, сохраняет в PostgreSQL только `refresh_token_hash`, а raw refresh token возвращает клиенту один раз и не хранит в открытом виде.
+
+Текущее состояние на 2026-06-01: `routes/mobile_v1.py` уже возвращает случайный `refresh_token`, но еще не создает запись `mobile_sessions` и не реализует refresh/logout/revoke endpoints. При реализации session-flow использовать эту таблицу.
 
 ### qr_login_sessions
 
