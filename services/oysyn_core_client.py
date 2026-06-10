@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Any, Dict, Optional
 
@@ -6,6 +7,8 @@ from dotenv import load_dotenv
 from fastapi import HTTPException, UploadFile, status
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class OysynCoreClient:
@@ -98,6 +101,25 @@ class OysynCoreClient:
             json={"email": email, "password": password},
         )
         return self._json(response)
+
+    def confirm_qr(self, user_id: int, token: str) -> Any:
+        response = self._request(
+            "POST",
+            "/auth/qr-confirm",
+            user_id=user_id,
+            json={"token": token},
+        )
+        payload = self._json(response)
+        masked_token = (
+            f"{token[:8]}...{token[-6:]}" if len(token) > 16 else "<short-token>"
+        )
+        logger.info(
+            "Oysyn Core QR confirm succeeded: user_id=%s token=%s response=%s",
+            user_id,
+            masked_token,
+            payload,
+        )
+        return payload
 
     def verify(self, user_id: int) -> Any:
         response = self._request("GET", "/auth/verify", user_id=user_id)

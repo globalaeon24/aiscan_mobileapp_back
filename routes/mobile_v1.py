@@ -1,3 +1,4 @@
+import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     status,
 )
@@ -17,7 +19,10 @@ from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
 
+from database import get_db
+from mobile_models import MobileUser, QrLoginEvent, QrLoginSession
 from services.oysyn_core_client import oysyn_core_client
 
 router = APIRouter()
@@ -27,6 +32,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=F
 SECRET_KEY = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("JWT_ALGORITHM") or os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+QR_LOGIN_EXPIRE_SECONDS = int(os.getenv("QR_LOGIN_EXPIRE_SECONDS", "120"))
 
 ALLOWED_REPORT_TYPES = {
     "full_report",
@@ -54,6 +60,32 @@ class MobileToken(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: dict
+
+
+class QrLoginCreateRequest(BaseModel):
+    web_session_id: Optional[str] = None
+
+
+class QrLoginCreateResponse(BaseModel):
+    qr_token: str
+    status: str
+    expires_at: datetime
+
+
+class QrLoginStatusResponse(BaseModel):
+    status: str
+    expires_at: datetime
+    approved_at: Optional[datetime] = None
+    rejected_at: Optional[datetime] = None
+    consumed_at: Optional[datetime] = None
+
+
+class QrLoginActionRequest(BaseModel):
+    device_id: Optional[str] = None
+
+
+class QrLoginActionResponse(BaseModel):
+    status: str
 
 
 def _credentials_exception() -> HTTPException:
@@ -87,6 +119,89 @@ def create_mobile_access_token(user_id: int) -> str:
     return jwt.encode(payload, secret_key, algorithm=ALGORITHM)
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def _user_agent(request: Request) -> Optional[str]:
+    return request.headers.get("user-agent")
+
+
+def _mark_expired_if_needed(
+    db: Session,
+    session: QrLoginSession,
+    request: Request,
+) -> bool:
+    if session.status != "pending" or _as_utc(session.expires_at) > _now():
+        return False
+
+    session.status = "expired"
+    db.add(
+        QrLoginEvent(
+            qr_login_session_id=session.id,
+            event_type="expired",
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+    )
+    db.commit()
+    db.refresh(session)
+    return True
+
+
+def _get_qr_session_or_404(db: Session, qr_token: str) -> QrLoginSession:
+    session = _find_qr_session(db, qr_token)
+    if not session:
+        raise HTTPException(status_code=404, detail="QR session not found")
+    return session
+
+
+def _find_qr_session(db: Session, qr_token: str) -> Optional[QrLoginSession]:
+    qr_token_hash = _hash_token(qr_token)
+    return (
+        db.query(QrLoginSession)
+        .filter(QrLoginSession.qr_token_hash == qr_token_hash)
+        .first()
+    )
+
+
+def _get_or_create_mobile_user(db: Session, core_user_id: int) -> MobileUser:
+    core_user_id_value = str(core_user_id)
+    mobile_user = (
+        db.query(MobileUser)
+        .filter(MobileUser.core_user_id == core_user_id_value)
+        .first()
+    )
+    if mobile_user:
+        return mobile_user
+
+    mobile_user = MobileUser(
+        core_user_id=core_user_id_value,
+        status="active",
+        last_synced_at=_now(),
+    )
+    db.add(mobile_user)
+    db.flush()
+    return mobile_user
+
+
 def get_mobile_user_id(token: Optional[str] = Depends(oauth2_scheme)) -> int:
     if not token:
         raise _credentials_exception()
@@ -99,6 +214,210 @@ def get_mobile_user_id(token: Optional[str] = Depends(oauth2_scheme)) -> int:
         return int(user_id)
     except (JWTError, ValueError):
         raise _credentials_exception()
+
+
+@router.post("/qr-login/sessions", response_model=QrLoginCreateResponse)
+def create_qr_login_session(
+    request: Request,
+    data: Optional[QrLoginCreateRequest] = None,
+    db: Session = Depends(get_db),
+) -> QrLoginCreateResponse:
+    data = data or QrLoginCreateRequest()
+    qr_token = secrets.token_urlsafe(48)
+    expires_at = _now() + timedelta(seconds=QR_LOGIN_EXPIRE_SECONDS)
+    session = QrLoginSession(
+        qr_token_hash=_hash_token(qr_token),
+        status="pending",
+        web_session_id=data.web_session_id,
+        requested_ip=_client_ip(request),
+        requested_user_agent=_user_agent(request),
+        expires_at=expires_at,
+    )
+    db.add(session)
+    db.flush()
+    db.add(
+        QrLoginEvent(
+            qr_login_session_id=session.id,
+            event_type="created",
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+            metadata_json={"web_session_id": data.web_session_id},
+        )
+    )
+    db.commit()
+    db.refresh(session)
+    return QrLoginCreateResponse(
+        qr_token=qr_token,
+        status=session.status,
+        expires_at=session.expires_at,
+    )
+
+
+@router.get("/qr-login/sessions/{qr_token}/status", response_model=QrLoginStatusResponse)
+def get_qr_login_status(
+    qr_token: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> QrLoginStatusResponse:
+    session = _get_qr_session_or_404(db, qr_token)
+    _mark_expired_if_needed(db, session, request)
+    return QrLoginStatusResponse(
+        status=session.status,
+        expires_at=session.expires_at,
+        approved_at=session.approved_at,
+        rejected_at=session.rejected_at,
+        consumed_at=session.consumed_at,
+    )
+
+
+@router.post(
+    "/qr-login/sessions/{qr_token}/approve",
+    response_model=QrLoginActionResponse,
+)
+def approve_qr_login_session(
+    qr_token: str,
+    request: Request,
+    data: Optional[QrLoginActionRequest] = None,
+    user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
+) -> QrLoginActionResponse:
+    data = data or QrLoginActionRequest()
+    session = _find_qr_session(db, qr_token)
+    if not session:
+        core_response = oysyn_core_client.confirm_qr(user_id, qr_token)
+        if isinstance(core_response, dict):
+            return QrLoginActionResponse(
+                status=core_response.get("status", "confirmed")
+            )
+        return QrLoginActionResponse(status="confirmed")
+
+    if _mark_expired_if_needed(db, session, request):
+        raise HTTPException(status_code=410, detail="QR session expired")
+    if session.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"QR session is already {session.status}",
+        )
+
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    session.status = "approved"
+    session.approved_by_mobile_user_id = mobile_user.id
+    session.approved_device_id = data.device_id
+    session.approved_at = _now()
+    db.add(
+        QrLoginEvent(
+            qr_login_session_id=session.id,
+            event_type="scanned",
+            mobile_user_id=mobile_user.id,
+            device_id=data.device_id,
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+    )
+    db.add(
+        QrLoginEvent(
+            qr_login_session_id=session.id,
+            event_type="approved",
+            mobile_user_id=mobile_user.id,
+            device_id=data.device_id,
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+    )
+    db.commit()
+    db.refresh(session)
+    return QrLoginActionResponse(status=session.status)
+
+
+@router.post(
+    "/qr-login/sessions/{qr_token}/reject",
+    response_model=QrLoginActionResponse,
+)
+def reject_qr_login_session(
+    qr_token: str,
+    request: Request,
+    data: Optional[QrLoginActionRequest] = None,
+    user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
+) -> QrLoginActionResponse:
+    data = data or QrLoginActionRequest()
+    session = _find_qr_session(db, qr_token)
+    if not session:
+        return QrLoginActionResponse(status="rejected")
+
+    if _mark_expired_if_needed(db, session, request):
+        raise HTTPException(status_code=410, detail="QR session expired")
+    if session.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"QR session is already {session.status}",
+        )
+
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    session.status = "rejected"
+    session.rejected_at = _now()
+    db.add(
+        QrLoginEvent(
+            qr_login_session_id=session.id,
+            event_type="scanned",
+            mobile_user_id=mobile_user.id,
+            device_id=data.device_id,
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+    )
+    db.add(
+        QrLoginEvent(
+            qr_login_session_id=session.id,
+            event_type="rejected",
+            mobile_user_id=mobile_user.id,
+            device_id=data.device_id,
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+    )
+    db.commit()
+    db.refresh(session)
+    return QrLoginActionResponse(status=session.status)
+
+
+@router.post(
+    "/qr-login/sessions/{qr_token}/consume",
+    response_model=QrLoginStatusResponse,
+)
+def consume_qr_login_session(
+    qr_token: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> QrLoginStatusResponse:
+    session = _get_qr_session_or_404(db, qr_token)
+    if _mark_expired_if_needed(db, session, request):
+        raise HTTPException(status_code=410, detail="QR session expired")
+    if session.status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=f"QR session is {session.status}",
+        )
+
+    session.status = "consumed"
+    session.consumed_at = _now()
+    db.add(
+        QrLoginEvent(
+            qr_login_session_id=session.id,
+            event_type="consumed",
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+    )
+    db.commit()
+    db.refresh(session)
+    return QrLoginStatusResponse(
+        status=session.status,
+        expires_at=session.expires_at,
+        approved_at=session.approved_at,
+        rejected_at=session.rejected_at,
+        consumed_at=session.consumed_at,
+    )
 
 
 @router.post("/auth/login", response_model=MobileToken)

@@ -11,8 +11,9 @@ Backend:
 - логинит пользователя через Oysyn Core Internal API;
 - выпускает mobile JWT access token;
 - возвращает refresh token, но refresh/logout/revoke flow еще не реализован;
+- поддерживает QR-login flow: подтверждает Oysyn Core QR token через `/auth/qr-confirm` и сохраняет local QR sessions/events для собственного fallback-flow;
 - проксирует profile, organizations, checks и reports в Oysyn Core;
-- хранит local mobile DB schema через SQLAlchemy/Alembic, но текущие `/api/v1` endpoints почти не пишут в mobile DB.
+- хранит local mobile DB schema через SQLAlchemy/Alembic; QR-login пишет sessions/events в mobile DB.
 
 ## Основные файлы
 
