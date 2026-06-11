@@ -129,6 +129,18 @@ class OysynCoreClient:
         response = self._request("GET", "/users/me", user_id=user_id)
         return self._json(response)
 
+    def get_user_sessions(self, user_id: int) -> Any:
+        response = self._request("GET", "/sessions/devices", user_id=user_id)
+        return self._json(response)
+
+    def revoke_user_session(self, user_id: int, session_id: int) -> Any:
+        response = self._request(
+            "POST",
+            f"/sessions/devices/{session_id}/revoke",
+            user_id=user_id,
+        )
+        return self._json(response)
+
     def get_checks(self, user_id: int, params: Dict[str, Any]) -> Any:
         response = self._request("GET", "/checks", user_id=user_id, params=params)
         return self._json(response)

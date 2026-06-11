@@ -1,8 +1,9 @@
 import hashlib
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -22,7 +23,13 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
 from database import get_db
-from mobile_models import MobileUser, QrLoginEvent, QrLoginSession
+from mobile_models import (
+    LinkedDeviceSession,
+    MobileSession,
+    MobileUser,
+    QrLoginEvent,
+    QrLoginSession,
+)
 from services.oysyn_core_client import oysyn_core_client
 
 router = APIRouter()
@@ -32,6 +39,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=F
 SECRET_KEY = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("JWT_ALGORITHM") or os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 QR_LOGIN_EXPIRE_SECONDS = int(os.getenv("QR_LOGIN_EXPIRE_SECONDS", "120"))
 
 ALLOWED_REPORT_TYPES = {
@@ -200,6 +208,230 @@ def _get_or_create_mobile_user(db: Session, core_user_id: int) -> MobileUser:
     db.add(mobile_user)
     db.flush()
     return mobile_user
+
+
+def _sync_mobile_user_snapshot(
+    mobile_user: MobileUser,
+    user: Dict[str, Any],
+) -> None:
+    mobile_user.email = user.get("email") or mobile_user.email
+    mobile_user.full_name = user.get("full_name") or mobile_user.full_name
+    organization_id = user.get("organization_id") or user.get("core_organization_id")
+    if organization_id is not None:
+        mobile_user.core_organization_id = str(organization_id)
+    if user.get("role") is not None:
+        mobile_user.role_snapshot = {"role": user.get("role")}
+    mobile_user.last_synced_at = _now()
+
+
+def _extract_session_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("items", "results", "data", "sessions", "devices"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+
+    return []
+
+
+def _first_text(item: Dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = item.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        return _as_utc(datetime.fromisoformat(text))
+    except ValueError:
+        return None
+
+
+def _parse_user_agent(user_agent: Optional[str]) -> Dict[str, Optional[str]]:
+    if not user_agent:
+        return {
+            "browser": None,
+            "browser_version": None,
+            "platform": None,
+            "os_version": None,
+            "device_type": None,
+        }
+
+    browser_patterns = [
+        ("Microsoft Edge", r"(?:Edg|Edge)/([\d.]+)"),
+        ("Chrome", r"Chrome/([\d.]+)"),
+        ("Firefox", r"Firefox/([\d.]+)"),
+        ("Safari", r"Version/([\d.]+).*Safari/"),
+    ]
+    browser = None
+    browser_version = None
+    for name, pattern in browser_patterns:
+        match = re.search(pattern, user_agent)
+        if match:
+            browser = name
+            browser_version = match.group(1)
+            break
+
+    platform = None
+    os_version = None
+    device_type = "desktop"
+
+    if "Android" in user_agent:
+        device_type = "mobile"
+        platform = "Android"
+        match = re.search(r"Android ([\d.]+)", user_agent)
+        os_version = match.group(1) if match else None
+    elif "iPhone" in user_agent:
+        device_type = "mobile"
+        platform = "iPhone"
+        match = re.search(r"OS ([\d_]+)", user_agent)
+        os_version = match.group(1).replace("_", ".") if match else None
+    elif "iPad" in user_agent:
+        device_type = "tablet"
+        platform = "iPad"
+        match = re.search(r"OS ([\d_]+)", user_agent)
+        os_version = match.group(1).replace("_", ".") if match else None
+    elif "Mac OS X" in user_agent:
+        platform = "macOS"
+        match = re.search(r"Mac OS X ([\d_]+)", user_agent)
+        os_version = match.group(1).replace("_", ".") if match else None
+    elif "Windows NT" in user_agent:
+        platform = "Windows"
+        match = re.search(r"Windows NT ([\d.]+)", user_agent)
+        os_version = match.group(1) if match else None
+    elif "Linux" in user_agent:
+        platform = "Linux"
+
+    return {
+        "browser": browser,
+        "browser_version": browser_version,
+        "platform": platform,
+        "os_version": os_version,
+        "device_type": device_type,
+    }
+
+
+def _normalize_linked_device_session(item: Dict[str, Any]) -> Dict[str, Any]:
+    session_id = _first_text(item, "id", "pk", "session_id", "sessionId")
+    if not session_id:
+        session_id = _hash_token(repr(sorted(item.items())))[:24]
+
+    user_agent = _first_text(item, "user_agent", "userAgent", "ua")
+    parsed_agent = _parse_user_agent(user_agent)
+    device_name = _first_text(
+        item,
+        "device_name",
+        "device",
+        "user_agent_device",
+        "browser",
+    )
+    browser = (
+        _first_text(item, "browser", "browser_name", "client")
+        or parsed_agent["browser"]
+    )
+    browser_version = _first_text(item, "browser_version") or parsed_agent[
+        "browser_version"
+    ]
+    platform = _first_text(item, "platform", "os", "os_name") or parsed_agent[
+        "platform"
+    ]
+    os_version = _first_text(item, "os_version") or parsed_agent["os_version"]
+    device_type = _first_text(item, "device_type") or parsed_agent["device_type"]
+    location = _first_text(item, "location", "city", "country")
+    ip_address = _first_text(item, "ip_address", "ip", "last_ip")
+    status_value = _first_text(item, "status") or "active"
+    revoked_at = _first_text(item, "revoked_at", "ended_at", "logout_at")
+    is_active = item.get("is_active")
+    status_text = status_value.lower()
+    if is_active is False or revoked_at:
+        status_text = "revoked"
+
+    first_seen = _first_text(
+        item,
+        "created_at",
+        "login_at",
+        "started_at",
+        "first_seen_at",
+    )
+    last_active = _first_text(
+        item,
+        "last_active_at",
+        "last_activity",
+        "updated_at",
+        "last_seen_at",
+    )
+
+    return {
+        "id": int(session_id) if str(session_id).isdigit() else session_id,
+        "core_session_id": str(session_id),
+        "device_name": device_name or browser or "Веб-браузер",
+        "browser": browser,
+        "browser_version": browser_version,
+        "platform": platform,
+        "os_version": os_version,
+        "device_type": device_type,
+        "location": location,
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "status": status_text,
+        "first_seen_at": first_seen,
+        "last_active_at": last_active,
+        "revoked_at": revoked_at,
+        "raw": item,
+    }
+
+
+def _cache_linked_device_sessions(
+    db: Session,
+    mobile_user_id: int,
+    sessions: List[Dict[str, Any]],
+) -> None:
+    for item in sessions:
+        session = (
+            db.query(LinkedDeviceSession)
+            .filter(
+                LinkedDeviceSession.mobile_user_id == mobile_user_id,
+                LinkedDeviceSession.core_session_id == item["core_session_id"],
+            )
+            .first()
+        )
+        if not session:
+            session = LinkedDeviceSession(
+                mobile_user_id=mobile_user_id,
+                core_session_id=item["core_session_id"],
+            )
+
+        session.device_name = item.get("device_name")
+        session.browser = item.get("browser")
+        session.browser_version = item.get("browser_version")
+        session.platform = item.get("platform")
+        session.os_version = item.get("os_version")
+        session.device_type = item.get("device_type")
+        session.location = item.get("location")
+        session.ip_address = item.get("ip_address")
+        session.user_agent = item.get("user_agent")
+        session.status = item.get("status") or "active"
+        session.first_seen_at = _parse_datetime(item.get("first_seen_at"))
+        session.last_active_at = _parse_datetime(item.get("last_active_at"))
+        session.revoked_at = _parse_datetime(item.get("revoked_at"))
+        session.raw_payload = item.get("raw")
+        db.add(session)
+    db.commit()
 
 
 def get_mobile_user_id(token: Optional[str] = Depends(oauth2_scheme)) -> int:
@@ -421,7 +653,11 @@ def consume_qr_login_session(
 
 
 @router.post("/auth/login", response_model=MobileToken)
-def login(data: LoginRequest) -> MobileToken:
+def login(
+    data: LoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> MobileToken:
     core_response = oysyn_core_client.login(data.email, data.password)
     user = core_response.get("user") if isinstance(core_response, dict) else None
 
@@ -433,6 +669,22 @@ def login(data: LoginRequest) -> MobileToken:
 
     access_token = create_mobile_access_token(int(user["id"]))
     refresh_token = secrets.token_urlsafe(48)
+    mobile_user = _get_or_create_mobile_user(db, int(user["id"]))
+    _sync_mobile_user_snapshot(mobile_user, user)
+
+    db.add(
+        MobileSession(
+            mobile_user_id=mobile_user.id,
+            device_id=data.device_id or f"mobile:{secrets.token_urlsafe(12)}",
+            refresh_token_hash=_hash_token(refresh_token),
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+            status="active",
+            last_used_at=_now(),
+            expires_at=_now() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+        )
+    )
+    db.commit()
 
     return MobileToken(
         access_token=access_token,
@@ -449,6 +701,50 @@ def verify(user_id: int = Depends(get_mobile_user_id)):
 @router.get("/me")
 def get_me(user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.get_me(user_id)
+
+
+@router.get("/sessions/devices")
+def get_linked_device_sessions(
+    user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
+):
+    core_response = oysyn_core_client.get_user_sessions(user_id)
+    sessions = [
+        _normalize_linked_device_session(item)
+        for item in _extract_session_items(core_response)
+    ]
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    _cache_linked_device_sessions(db, mobile_user.id, sessions)
+    return {"items": sessions}
+
+
+@router.post("/sessions/devices/{session_id}/revoke")
+def revoke_linked_device_session(
+    session_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
+):
+    core_response = oysyn_core_client.revoke_user_session(user_id, session_id)
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    session = (
+        db.query(LinkedDeviceSession)
+        .filter(
+            LinkedDeviceSession.mobile_user_id == mobile_user.id,
+            LinkedDeviceSession.core_session_id == str(session_id),
+        )
+        .first()
+    )
+    if session:
+        session.status = "revoked"
+        session.revoked_at = _now()
+        db.add(session)
+        db.commit()
+
+    return {
+        "status": "revoked",
+        "session_id": session_id,
+        "core": core_response if isinstance(core_response, dict) else None,
+    }
 
 
 @router.get("/organizations/{organization_id}")

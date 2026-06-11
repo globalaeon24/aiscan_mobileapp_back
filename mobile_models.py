@@ -39,6 +39,10 @@ class MobileUser(Base):
         foreign_keys="MobileSession.mobile_user_id",
         back_populates="mobile_user",
     )
+    linked_device_sessions = relationship(
+        "LinkedDeviceSession",
+        back_populates="mobile_user",
+    )
     push_tokens = relationship("PushToken", back_populates="mobile_user")
 
     __table_args__ = (
@@ -111,6 +115,41 @@ class MobileSession(Base):
         Index("ix_mobile_sessions_refresh_token_hash", "refresh_token_hash"),
         Index("ix_mobile_sessions_expires_at", "expires_at"),
         Index("ix_mobile_sessions_created_at", "created_at"),
+    )
+
+
+class LinkedDeviceSession(Base):
+    __tablename__ = "linked_device_sessions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    mobile_user_id = Column(BigInteger, ForeignKey("mobile_users.id"), nullable=False)
+    core_session_id = Column(String(128), nullable=False)
+    device_name = Column(String(255), nullable=True)
+    browser = Column(String(128), nullable=True)
+    browser_version = Column(String(64), nullable=True)
+    platform = Column(String(128), nullable=True)
+    os_version = Column(String(128), nullable=True)
+    device_type = Column(String(64), nullable=True)
+    location = Column(String(255), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default="active")
+    first_seen_at = Column(DateTime(timezone=True), nullable=True)
+    last_active_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    raw_payload = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    mobile_user = relationship("MobileUser", back_populates="linked_device_sessions")
+
+    __table_args__ = (
+        UniqueConstraint("mobile_user_id", "core_session_id", name="uq_linked_device_sessions_user_core_session"),
+        Index("ix_linked_device_sessions_mobile_user_id", "mobile_user_id"),
+        Index("ix_linked_device_sessions_core_session_id", "core_session_id"),
+        Index("ix_linked_device_sessions_status", "status"),
+        Index("ix_linked_device_sessions_last_active_at", "last_active_at"),
+        Index("ix_linked_device_sessions_created_at", "created_at"),
     )
 
 
