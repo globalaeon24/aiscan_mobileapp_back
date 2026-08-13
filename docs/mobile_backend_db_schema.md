@@ -1,6 +1,6 @@
 # Mobile Backend DB Schema
 
-Актуально на 2026-06-01.
+Актуально на 2026-08-10.
 
 ## Правило поддержки схемы
 
@@ -8,13 +8,15 @@
 
 ## Текущий runtime статус
 
-SQLAlchemy-модели и Alembic-миграции для mobile DB уже созданы. При этом текущие публичные endpoints в `routes/mobile_v1.py` в основном работают как proxy к Oysyn Core Internal API и пока почти не используют эти таблицы.
+SQLAlchemy-модели и Alembic-миграции `001`–`007` созданы. Большинство public endpoints в `routes/mobile_v1.py` остаются proxy к Oysyn Core Internal API, но часть mobile-инфраструктуры уже используется.
 
 Это осознанное промежуточное состояние:
 
 - Core остается source of truth по пользователям, организациям, ролям, проверкам и отчетам;
-- mobile DB подготовлена под sessions/devices/QR/2FA/push/audit/mobile-specific state;
-- при добавлении refresh/logout, device tracking, QR-login, 2FA, push и notifications нужно использовать эту схему, а не создавать параллельные таблицы.
+- login создаёт `mobile_users` и `mobile_sessions`; в последней хранится hash refresh-токена;
+- local QR flow пишет `qr_login_sessions` и `qr_login_events`;
+- список веб-устройств из Core кэшируется в `linked_device_sessions`;
+- `mobile_devices`, `push_tokens`, 2FA, notifications и остальная mobile-specific state подготовлены для будущих endpoint'ов.
 
 ## Назначение mobile backend БД
 
@@ -88,6 +90,14 @@ Redis хранит только краткоживущие и чувствите
 
 Таблицы: `mobile_user_settings`, `notification_preferences`, `app_versions`, `core_api_requests`, `sync_jobs`.
 
+### 006 linked device sessions
+
+Таблица: `linked_device_sessions` — нормализованный cache веб-сессий пользователя, полученных из Oysyn Core.
+
+### 007 linked device user-agent fields
+
+Добавляет к `linked_device_sessions`: `browser_version`, `os_version`, `device_type`, `user_agent`.
+
 ## Таблицы
 
 ### mobile_users
@@ -124,7 +134,17 @@ Redis хранит только краткоживущие и чувствите
 
 Целевое поведение: после успешного Core login Mobile Backend создает собственные mobile `access_token` и `refresh_token`, сохраняет в PostgreSQL только `refresh_token_hash`, а raw refresh token возвращает клиенту один раз и не хранит в открытом виде.
 
-Текущее состояние на 2026-06-01: `routes/mobile_v1.py` уже возвращает случайный `refresh_token`, но еще не создает запись `mobile_sessions` и не реализует refresh/logout/revoke endpoints. При реализации session-flow использовать эту таблицу.
+Текущее состояние: успешный login создаёт запись `mobile_sessions`, а `refresh_token_hash` содержит SHA-256 от raw refresh token. Raw token возвращается клиенту один раз. `/auth/refresh`, `/auth/logout` и revoke mobile sessions пока не реализованы; access JWT не проверяется по status этой записи. При реализации session-flow использовать эту таблицу и ротацию refresh token.
+
+### linked_device_sessions
+
+Кэш веб-сессий текущего Core-пользователя. Записи не являются источником истины: `GET /api/v1/sessions/devices` всегда запрашивает данные у Oysyn Core и затем обновляет cache; revoke также сначала выполняется в Core.
+
+Поля: `id`, `mobile_user_id`, `core_session_id`, `device_name`, `browser`, `browser_version`, `platform`, `os_version`, `device_type`, `location`, `ip_address`, `user_agent`, `status`, `first_seen_at`, `last_active_at`, `revoked_at`, `raw_payload`, `created_at`, `updated_at`.
+
+Ограничение: пара `mobile_user_id` + `core_session_id` уникальна.
+
+Индексы: `mobile_user_id`, `core_session_id`, `status`, `last_active_at`, `created_at`.
 
 ### qr_login_sessions
 
@@ -308,7 +328,7 @@ Severity: `low`, `medium`, `high`, `critical`.
 
 ## Связи между таблицами
 
-- `mobile_users.id` -> `mobile_devices.mobile_user_id`, `mobile_sessions.mobile_user_id`, `push_tokens.mobile_user_id`, `notifications.mobile_user_id`, `mobile_check_requests.mobile_user_id`, `audit_logs.mobile_user_id`, `security_events.mobile_user_id`, `mobile_user_settings.mobile_user_id`, `notification_preferences.mobile_user_id`.
+- `mobile_users.id` -> `mobile_devices.mobile_user_id`, `mobile_sessions.mobile_user_id`, `linked_device_sessions.mobile_user_id`, `push_tokens.mobile_user_id`, `notifications.mobile_user_id`, `mobile_check_requests.mobile_user_id`, `audit_logs.mobile_user_id`, `security_events.mobile_user_id`, `mobile_user_settings.mobile_user_id`, `notification_preferences.mobile_user_id`.
 - `mobile_devices.device_id` используется как стабильный внешний идентификатор устройства в сессиях, push-токенах, QR-login и аудитах.
 - `notifications.id` -> `notification_deliveries.notification_id`.
 - `qr_login_sessions.id` -> `qr_login_events.qr_login_session_id`.
