@@ -14,6 +14,9 @@ cors_allowed_origins = [
     for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
+cors_allowed_origin_regex = os.getenv("CORS_ALLOWED_ORIGIN_REGEX", "").strip()
+if environment == "stage" and not cors_allowed_origin_regex:
+    cors_allowed_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
 app = FastAPI(
     title="Oysyn Mobile Backend",
@@ -22,11 +25,12 @@ app = FastAPI(
     openapi_url="/api/openapi.json" 
 )
 
-if cors_allowed_origins:
+if cors_allowed_origins or cors_allowed_origin_regex:
     allow_credentials = "*" not in cors_allowed_origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_allowed_origins,
+        allow_origin_regex=cors_allowed_origin_regex or None,
         allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],

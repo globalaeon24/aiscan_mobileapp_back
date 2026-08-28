@@ -19,7 +19,7 @@ from fastapi import (
 from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -51,7 +51,7 @@ ALLOWED_REPORT_TYPES = {
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     device_id: Optional[str] = None
     platform: Optional[str] = None
@@ -61,6 +61,14 @@ class LoginRequest(BaseModel):
     app_version: Optional[str] = None
     push_token: Optional[str] = None
     push_provider: Optional[str] = None
+
+    @field_validator("email", "password")
+    @classmethod
+    def validate_credentials(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Поле обязательно")
+        return value
 
 
 class MobileToken(BaseModel):
