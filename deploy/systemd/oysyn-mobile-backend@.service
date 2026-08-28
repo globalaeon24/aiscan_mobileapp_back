@@ -1,0 +1,20 @@
+[Unit]
+Description=Oysyn Mobile Backend (%i)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oysyn
+Group=oysyn
+WorkingDirectory=/opt/oysyn-mobile-backend-%i
+EnvironmentFile=/etc/oysyn-mobile/%i.env
+ExecStart=/opt/oysyn-mobile-backend-%i/venv/bin/uvicorn main:app --host 127.0.0.1 --port ${PORT}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

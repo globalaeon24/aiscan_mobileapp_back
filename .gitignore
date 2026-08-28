@@ -17,11 +17,14 @@ env/
 .env
 .env.*
 !.env.example
+!.env.stage.example
+!.env.production.example
 *.pem
 *.key
 id_rsa*
 id_ed25519*
 *@*
+!deploy/systemd/oysyn-mobile-backend@.service
 
 # OS/editor
 .DS_Store

@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -6,32 +8,43 @@ load_dotenv()
 
 from routes.mobile_v1 import router as mobile_v1_router
 
+environment = os.getenv("ENVIRONMENT", "development").strip().lower()
+cors_allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
 app = FastAPI(
-    title="ScanAI Backend",
+    title="Oysyn Mobile Backend",
     version="1.0.0",
     docs_url="/api/docs",           
     openapi_url="/api/openapi.json" 
 )
 
-# На первом этапе оставим CORS максимально открытым,
-# потом можно будет сузить под домен/приложение.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # ПОТОМ УЖЕЖЕСТИМ
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if cors_allowed_origins:
+    allow_credentials = "*" not in cors_allowed_origins
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "app": "scanai-backend"}
+    return {
+        "status": "ok",
+        "app": "oysyn-mobile-backend",
+        "environment": environment,
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "environment": environment}
 
 
 app.include_router(mobile_v1_router, prefix="/api/v1", tags=["mobile-v1"])
