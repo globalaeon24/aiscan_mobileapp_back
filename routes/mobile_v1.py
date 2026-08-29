@@ -763,6 +763,37 @@ def get_organization(
     return oysyn_core_client.get_organization(user_id, organization_id)
 
 
+@router.get("/organizations")
+def get_organizations(user_id: int = Depends(get_mobile_user_id)):
+    return oysyn_core_client.get_organizations(user_id)
+
+
+@router.get("/organizations/{organization_id}/users")
+def get_organization_users(
+    organization_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_users(user_id, organization_id)
+
+
+@router.get("/organizations/{organization_id}/api-settings")
+def get_organization_api_settings(
+    organization_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_api_settings(
+        user_id, organization_id
+    )
+
+
+@router.get("/organizations/{organization_id}/billing")
+def get_organization_billing(
+    organization_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_billing(user_id, organization_id)
+
+
 @router.get("/checks")
 def get_checks(
     status_filter: Optional[str] = Query(default=None, alias="status"),

@@ -157,6 +157,36 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def get_organizations(self, user_id: int) -> Any:
+        response = self._request("GET", "/organizations", user_id=user_id)
+        return self._json(response)
+
+    def get_organization_users(self, user_id: int, organization_id: int) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/users/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def get_organization_api_settings(
+        self, user_id: int, organization_id: int
+    ) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/api_settings/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def get_organization_billing(self, user_id: int, organization_id: int) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/billing/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
     async def create_check(
         self,
         user_id: int,
