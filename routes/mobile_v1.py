@@ -894,6 +894,20 @@ async def create_check(
     modules_kz: Optional[str] = Form(default=None),
     user_id: int = Depends(get_mobile_user_id),
 ):
+    user = oysyn_core_client.get_me(user_id)
+    try:
+        checks_available = int(user.get("checks_available", 0))
+    except (TypeError, ValueError, AttributeError):
+        checks_available = 0
+    if checks_available <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Лимит проверок исчерпан. "
+                "Обратитесь к администратору организации."
+            ),
+        )
+
     form = {
         "title": title,
         "include_ocr": str(include_ocr).lower(),
