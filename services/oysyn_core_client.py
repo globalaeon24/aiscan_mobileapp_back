@@ -187,6 +187,16 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def get_organization_billing_journal(
+        self, user_id: int, organization_id: int
+    ) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/billing-journal/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
     async def create_check(
         self,
         user_id: int,

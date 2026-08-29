@@ -794,6 +794,16 @@ def get_organization_billing(
     return oysyn_core_client.get_organization_billing(user_id, organization_id)
 
 
+@router.get("/organizations/{organization_id}/billing-journal")
+def get_organization_billing_journal(
+    organization_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_billing_journal(
+        user_id, organization_id
+    )
+
+
 @router.get("/checks")
 def get_checks(
     status_filter: Optional[str] = Query(default=None, alias="status"),
