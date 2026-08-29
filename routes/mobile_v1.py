@@ -776,6 +776,11 @@ def get_checks(
     return oysyn_core_client.get_checks(user_id, params)
 
 
+@router.get("/checks/modules")
+def get_check_modules(user_id: int = Depends(get_mobile_user_id)):
+    return oysyn_core_client.get_check_modules(user_id)
+
+
 @router.post("/checks", status_code=status.HTTP_201_CREATED)
 async def create_check(
     title: str = Form(...),
@@ -786,6 +791,8 @@ async def create_check(
     include_ocr: bool = Form(default=False),
     ocr_languages: str = Form(default="rus"),
     ai_check: bool = Form(default=True),
+    modules: Optional[str] = Form(default=None),
+    modules_kz: Optional[str] = Form(default=None),
     user_id: int = Depends(get_mobile_user_id),
 ):
     form = {
@@ -798,6 +805,8 @@ async def create_check(
         "author": author,
         "department": department,
         "document_type": document_type,
+        "modules": modules,
+        "modules_kz": modules_kz,
     }
     form.update({key: value for key, value in optional_values.items() if value})
 

@@ -145,6 +145,10 @@ class OysynCoreClient:
         response = self._request("GET", "/checks", user_id=user_id, params=params)
         return self._json(response)
 
+    def get_check_modules(self, user_id: int) -> Any:
+        response = self._request("GET", "/checks/modules", user_id=user_id)
+        return self._json(response)
+
     def get_organization(self, user_id: int, organization_id: int) -> Any:
         response = self._request(
             "GET",
