@@ -169,6 +169,32 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def create_organization_user(
+        self, user_id: int, organization_id: int, payload: Dict[str, Any]
+    ) -> Any:
+        response = self._request(
+            "POST",
+            f"/organizations/{organization_id}/users/",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
+    def update_organization_user(
+        self,
+        user_id: int,
+        organization_id: int,
+        target_user_id: int,
+        payload: Dict[str, Any],
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/organizations/{organization_id}/users/{target_user_id}/",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
     def get_organization_api_settings(
         self, user_id: int, organization_id: int
     ) -> Any:
@@ -184,6 +210,21 @@ class OysynCoreClient:
             "GET",
             f"/organizations/{organization_id}/billing/",
             user_id=user_id,
+        )
+        return self._json(response)
+
+    def update_organization_billing(
+        self,
+        user_id: int,
+        organization_id: int,
+        target_user_id: int,
+        payload: Dict[str, Any],
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/organizations/{organization_id}/billing/{target_user_id}/",
+            user_id=user_id,
+            json=payload,
         )
         return self._json(response)
 

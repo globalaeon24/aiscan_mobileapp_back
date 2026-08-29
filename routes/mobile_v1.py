@@ -78,6 +78,21 @@ class MobileToken(BaseModel):
     user: dict
 
 
+class OrganizationUserPayload(BaseModel):
+    email: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class OrganizationBillingPayload(BaseModel):
+    checks_available: int
+
+
 class QrLoginCreateRequest(BaseModel):
     web_session_id: Optional[str] = None
 
@@ -776,6 +791,34 @@ def get_organization_users(
     return oysyn_core_client.get_organization_users(user_id, organization_id)
 
 
+@router.post("/organizations/{organization_id}/users", status_code=201)
+def create_organization_user(
+    organization_id: int,
+    payload: OrganizationUserPayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.create_organization_user(
+        user_id,
+        organization_id,
+        payload.model_dump(exclude_none=True),
+    )
+
+
+@router.patch("/organizations/{organization_id}/users/{target_user_id}")
+def update_organization_user(
+    organization_id: int,
+    target_user_id: int,
+    payload: OrganizationUserPayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.update_organization_user(
+        user_id,
+        organization_id,
+        target_user_id,
+        payload.model_dump(exclude_none=True),
+    )
+
+
 @router.get("/organizations/{organization_id}/api-settings")
 def get_organization_api_settings(
     organization_id: int,
@@ -792,6 +835,21 @@ def get_organization_billing(
     user_id: int = Depends(get_mobile_user_id),
 ):
     return oysyn_core_client.get_organization_billing(user_id, organization_id)
+
+
+@router.patch("/organizations/{organization_id}/billing/{target_user_id}")
+def update_organization_billing(
+    organization_id: int,
+    target_user_id: int,
+    payload: OrganizationBillingPayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.update_organization_billing(
+        user_id,
+        organization_id,
+        target_user_id,
+        payload.model_dump(),
+    )
 
 
 @router.get("/organizations/{organization_id}/billing-journal")
