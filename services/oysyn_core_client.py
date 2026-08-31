@@ -129,6 +129,11 @@ class OysynCoreClient:
         response = self._request("GET", "/users/me", user_id=user_id)
         return self._json(response)
 
+    def update_me(self, user_id: int, payload: Dict[str, Any]) -> Any:
+        response = self._request(
+            "PATCH", "/users/me", user_id=user_id, json=payload
+        )
+        return self._json(response)
     def get_user_sessions(self, user_id: int) -> Any:
         response = self._request("GET", "/sessions/devices", user_id=user_id)
         return self._json(response)
@@ -145,10 +150,107 @@ class OysynCoreClient:
         response = self._request("GET", "/checks", user_id=user_id, params=params)
         return self._json(response)
 
+    def get_check_modules(self, user_id: int) -> Any:
+        response = self._request("GET", "/checks/modules", user_id=user_id)
+        return self._json(response)
+
+    def get_folders(self, user_id: int) -> Any:
+        response = self._request("GET", "/folders", user_id=user_id)
+        return self._json(response)
+
     def get_organization(self, user_id: int, organization_id: int) -> Any:
         response = self._request(
             "GET",
             f"/organizations/{organization_id}",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def get_organizations(self, user_id: int) -> Any:
+        response = self._request("GET", "/organizations", user_id=user_id)
+        return self._json(response)
+
+    def get_organization_users(self, user_id: int, organization_id: int) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/users/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def create_organization_user(
+        self, user_id: int, organization_id: int, payload: Dict[str, Any]
+    ) -> Any:
+        response = self._request(
+            "POST",
+            f"/organizations/{organization_id}/users/",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
+    def update_organization_user(
+        self,
+        user_id: int,
+        organization_id: int,
+        target_user_id: int,
+        payload: Dict[str, Any],
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/organizations/{organization_id}/users/{target_user_id}/",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
+    def get_organization_api_settings(
+        self, user_id: int, organization_id: int
+    ) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/api_settings/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def get_organization_billing(self, user_id: int, organization_id: int) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/billing/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def update_organization_billing(
+        self,
+        user_id: int,
+        organization_id: int,
+        target_user_id: int,
+        payload: Dict[str, Any],
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/organizations/{organization_id}/billing/{target_user_id}/",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
+    def get_organization_billing_journal(
+        self, user_id: int, organization_id: int
+    ) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/billing-journal/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def get_organization_reports(self, user_id: int, organization_id: int) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/reports/",
             user_id=user_id,
         )
         return self._json(response)

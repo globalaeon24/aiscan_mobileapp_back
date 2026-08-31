@@ -10,10 +10,10 @@ Backend:
 
 - логинит пользователя через Oysyn Core Internal API;
 - выпускает mobile JWT access token;
-- создаёт `mobile_sessions` и хранит SHA-256 hash refresh token; refresh/logout/revoke flow ещё не реализован;
+- создаёт `mobile_sessions`, хранит SHA-256 hash refresh token и связывает access token с конкретной мобильной сессией;
 - поддерживает QR-login flow: подтверждает Oysyn Core QR token через `/auth/qr-confirm` и сохраняет local QR sessions/events для собственного fallback-flow;
 - проксирует profile, organizations, checks и reports в Oysyn Core;
-- получает и отзывает подключённые веб-сессии пользователя через Oysyn Core, кэшируя нормализованные snapshots в `linked_device_sessions`;
+- объединяет мобильные и веб-сессии пользователя, позволяет отзывать их и кэширует Core snapshots в `linked_device_sessions`;
 - хранит local mobile DB schema через SQLAlchemy/Alembic; QR-login пишет sessions/events в mobile DB.
 
 ## Основные файлы
