@@ -50,6 +50,13 @@ ALLOWED_REPORT_TYPES = {
 }
 
 
+def _truncate_optional(value: Optional[str], max_length: int) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized[:max_length] or None
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -70,12 +77,39 @@ class LoginRequest(BaseModel):
             raise ValueError("Поле обязательно")
         return value
 
+    @field_validator("device_id", "device_name", "device_model")
+    @classmethod
+    def normalize_device_text(cls, value: Optional[str]) -> Optional[str]:
+        return _truncate_optional(value, 255)
+
+    @field_validator("platform", "push_provider")
+    @classmethod
+    def normalize_platform_text(cls, value: Optional[str]) -> Optional[str]:
+        return _truncate_optional(value, 32)
+
+    @field_validator("os_version", "app_version")
+    @classmethod
+    def normalize_version_text(cls, value: Optional[str]) -> Optional[str]:
+        return _truncate_optional(value, 64)
+
 
 class MobileToken(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
     user: dict
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+    @field_validator("refresh_token")
+    @classmethod
+    def validate_refresh_token(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Поле обязательно")
+        return value
 
 
 class OrganizationUserPayload(BaseModel):
@@ -91,6 +125,14 @@ class OrganizationUserPayload(BaseModel):
 
 class OrganizationBillingPayload(BaseModel):
     checks_available: int
+
+
+class ProfileUpdatePayload(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    city: Optional[str] = None
 
 
 class QrLoginCreateRequest(BaseModel):
@@ -716,6 +758,56 @@ def login(
     )
 
 
+@router.post("/auth/refresh", response_model=MobileToken)
+def refresh_access_token(
+    data: RefreshTokenRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> MobileToken:
+    session = (
+        db.query(MobileSession)
+        .filter(MobileSession.refresh_token_hash == _hash_token(data.refresh_token))
+        .first()
+    )
+    if (
+        not session
+        or session.status != "active"
+        or session.revoked_at is not None
+        or _as_utc(session.expires_at) <= _now()
+    ):
+        raise _credentials_exception()
+
+    mobile_user = session.mobile_user
+    if not mobile_user or not mobile_user.core_user_id:
+        raise _credentials_exception()
+
+    try:
+        core_user_id = int(mobile_user.core_user_id)
+    except (TypeError, ValueError):
+        raise _credentials_exception()
+
+    user = oysyn_core_client.get_me(core_user_id)
+    if not isinstance(user, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Oysyn Core API returned invalid user data",
+        )
+
+    refresh_token = secrets.token_urlsafe(48)
+    session.refresh_token_hash = _hash_token(refresh_token)
+    session.last_used_at = _now()
+    session.ip_address = _client_ip(request)
+    session.user_agent = _user_agent(request)
+    _sync_mobile_user_snapshot(mobile_user, user)
+    db.commit()
+
+    return MobileToken(
+        access_token=create_mobile_access_token(core_user_id),
+        refresh_token=refresh_token,
+        user=user,
+    )
+
+
 @router.get("/auth/verify")
 def verify(user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.verify(user_id)
@@ -724,6 +816,17 @@ def verify(user_id: int = Depends(get_mobile_user_id)):
 @router.get("/me")
 def get_me(user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.get_me(user_id)
+
+
+@router.patch("/me")
+def update_me(
+    payload: ProfileUpdatePayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.update_me(
+        user_id,
+        payload.model_dump(exclude_none=True),
+    )
 
 
 @router.get("/sessions/devices")
@@ -862,9 +965,18 @@ def get_organization_billing_journal(
     )
 
 
+@router.get("/organizations/{organization_id}/reports")
+def get_organization_reports(
+    organization_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_reports(user_id, organization_id)
+
+
 @router.get("/checks")
 def get_checks(
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    folder_id: Optional[int] = Query(default=None, ge=1),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     user_id: int = Depends(get_mobile_user_id),
@@ -872,7 +984,14 @@ def get_checks(
     params = {"page": page, "page_size": page_size}
     if status_filter:
         params["status"] = status_filter
+    if folder_id is not None:
+        params["folder_id"] = folder_id
     return oysyn_core_client.get_checks(user_id, params)
+
+
+@router.get("/folders")
+def get_folders(user_id: int = Depends(get_mobile_user_id)):
+    return oysyn_core_client.get_folders(user_id)
 
 
 @router.get("/checks/modules")
@@ -933,6 +1052,20 @@ async def create_check(
 @router.get("/checks/{check_id}")
 def get_check(check_id: int, user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.get_check(user_id, check_id)
+
+
+@router.delete("/checks/{check_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_check(check_id: int, user_id: int = Depends(get_mobile_user_id)):
+    try:
+        oysyn_core_client.delete_check(user_id, check_id)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_405_METHOD_NOT_ALLOWED:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="Удаление документов пока не поддерживается Oysyn Core API",
+            ) from exc
+        raise
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/checks/{check_id}/report")

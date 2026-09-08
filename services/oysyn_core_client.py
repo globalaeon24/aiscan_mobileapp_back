@@ -129,6 +129,12 @@ class OysynCoreClient:
         response = self._request("GET", "/users/me", user_id=user_id)
         return self._json(response)
 
+    def update_me(self, user_id: int, payload: Dict[str, Any]) -> Any:
+        response = self._request(
+            "PATCH", "/users/me", user_id=user_id, json=payload
+        )
+        return self._json(response)
+
     def get_user_sessions(self, user_id: int) -> Any:
         response = self._request("GET", "/sessions/devices", user_id=user_id)
         return self._json(response)
@@ -147,6 +153,10 @@ class OysynCoreClient:
 
     def get_check_modules(self, user_id: int) -> Any:
         response = self._request("GET", "/checks/modules", user_id=user_id)
+        return self._json(response)
+
+    def get_folders(self, user_id: int) -> Any:
+        response = self._request("GET", "/folders", user_id=user_id)
         return self._json(response)
 
     def get_organization(self, user_id: int, organization_id: int) -> Any:
@@ -238,6 +248,14 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def get_organization_reports(self, user_id: int, organization_id: int) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/reports/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
     async def create_check(
         self,
         user_id: int,
@@ -265,6 +283,9 @@ class OysynCoreClient:
     def get_check(self, user_id: int, check_id: int) -> Any:
         response = self._request("GET", f"/checks/{check_id}", user_id=user_id)
         return self._json(response)
+
+    def delete_check(self, user_id: int, check_id: int) -> None:
+        self._request("DELETE", f"/checks/{check_id}", user_id=user_id)
 
     def get_report(self, user_id: int, check_id: int) -> Any:
         response = self._request(
