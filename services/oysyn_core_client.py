@@ -256,6 +256,33 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def get_organization_deleted_checks(
+        self,
+        user_id: int,
+        organization_id: int,
+        params: Dict[str, Any],
+    ) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/checks/deleted/",
+            user_id=user_id,
+            params=params,
+        )
+        return self._json(response)
+
+    def restore_organization_check(
+        self,
+        user_id: int,
+        organization_id: int,
+        check_id: int,
+    ) -> Any:
+        response = self._request(
+            "POST",
+            f"/organizations/{organization_id}/checks/{check_id}/restore/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
     async def create_check(
         self,
         user_id: int,

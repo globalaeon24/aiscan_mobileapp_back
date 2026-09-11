@@ -50,6 +50,32 @@ ALLOWED_REPORT_TYPES = {
 }
 
 
+@router.get("/app/version")
+def get_app_version(
+    platform: str = Query(pattern="^(android|ios)$"),
+):
+    prefix = "ANDROID" if platform == "android" else "IOS"
+    default_store_url = (
+        "https://play.google.com/store/apps/details?id=asia.oysyn.mobile"
+        if platform == "android"
+        else ""
+    )
+    latest_version = os.getenv(f"APP_UPDATE_{prefix}_LATEST_VERSION", "1.0.8")
+    latest_build = int(os.getenv(f"APP_UPDATE_{prefix}_LATEST_BUILD", "9"))
+    store_url = os.getenv(f"APP_UPDATE_{prefix}_STORE_URL", default_store_url)
+    return {
+        "enabled": bool(store_url),
+        "latest_version": latest_version,
+        "latest_build": latest_build,
+        "title": os.getenv("APP_UPDATE_TITLE", "Доступна новая версия OySyn"),
+        "message": os.getenv(
+            "APP_UPDATE_MESSAGE",
+            "Мы улучшили стабильность приложения и работу с документами.",
+        ),
+        "store_url": store_url,
+    }
+
+
 def _truncate_optional(value: Optional[str], max_length: int) -> Optional[str]:
     if value is None:
         return None
@@ -971,6 +997,33 @@ def get_organization_reports(
     user_id: int = Depends(get_mobile_user_id),
 ):
     return oysyn_core_client.get_organization_reports(user_id, organization_id)
+
+
+@router.get("/organizations/{organization_id}/checks/deleted")
+def get_organization_deleted_checks(
+    organization_id: int,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_deleted_checks(
+        user_id,
+        organization_id,
+        {"page": page, "page_size": page_size},
+    )
+
+
+@router.post("/organizations/{organization_id}/checks/{check_id}/restore")
+def restore_organization_check(
+    organization_id: int,
+    check_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.restore_organization_check(
+        user_id,
+        organization_id,
+        check_id,
+    )
 
 
 @router.get("/checks")
