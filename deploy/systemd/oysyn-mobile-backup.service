@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Oysyn Mobile Backend databases
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backup-oysyn-mobile
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/backups/oysyn-mobile
