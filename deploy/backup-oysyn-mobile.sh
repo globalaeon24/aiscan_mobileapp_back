@@ -5,7 +5,7 @@ backup_dir=/var/backups/oysyn-mobile
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 
 umask 077
-install -d -m 0750 -o root -g oysyn "$backup_dir"
+install -d -m 0750 -o root -g postgres "$backup_dir"
 
 for database in oysyn_mobile_stage oysyn_mobile_prod; do
   output="$backup_dir/${database}_${timestamp}.dump"
