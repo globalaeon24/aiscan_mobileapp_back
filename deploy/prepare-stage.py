@@ -5,6 +5,7 @@ import grp
 import os
 from pathlib import Path
 import secrets
+import shlex
 import subprocess
 
 
@@ -54,9 +55,24 @@ def main() -> None:
         "OYSYN_CORE_SERVICE_TOKEN": "",
         "OYSYN_CORE_API_TIMEOUT": "30",
         "CORS_ALLOWED_ORIGINS": "",
+        "APP_UPDATE_ANDROID_LATEST_VERSION": "1.0.8",
+        "APP_UPDATE_ANDROID_LATEST_BUILD": "14",
+        "APP_UPDATE_ANDROID_MINIMUM_SUPPORTED_BUILD": "0",
+        "APP_UPDATE_ANDROID_REQUIRED": "false",
+        "APP_UPDATE_ANDROID_STORE_URL": "https://play.google.com/store/apps/details?id=asia.oysyn.mobile",
+        "APP_UPDATE_IOS_LATEST_VERSION": "1.0.8",
+        "APP_UPDATE_IOS_LATEST_BUILD": "14",
+        "APP_UPDATE_IOS_MINIMUM_SUPPORTED_BUILD": "0",
+        "APP_UPDATE_IOS_REQUIRED": "false",
+        "APP_UPDATE_IOS_STORE_URL": "https://apps.apple.com/kz/app/oysyn/id6810601982",
+        "APP_UPDATE_REMIND_AFTER_HOURS": "24",
+        "APP_UPDATE_TITLE": "Доступна новая версия OySyn",
+        "APP_UPDATE_MESSAGE": "Мы выпустили новую версию приложения с улучшениями и исправлениями.",
     }
     ENV_PATH.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-    content = "".join(f"{key}={value}\n" for key, value in values.items())
+    content = "".join(
+        f"{key}={shlex.quote(value)}\n" for key, value in values.items()
+    )
     fd = os.open(ENV_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
     try:
         os.fchown(fd, 0, grp.getgrnam("oysyn").gr_gid)

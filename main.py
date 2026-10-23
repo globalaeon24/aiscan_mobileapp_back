@@ -1,4 +1,6 @@
+import asyncio
 import os
+from contextlib import suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from routes.mobile_v1 import router as mobile_v1_router
+from routes.mobile_v1 import (
+    reconcile_pending_check_notifications,
+    router as mobile_v1_router,
+)
 
 environment = os.getenv("ENVIRONMENT", "development").strip().lower()
 cors_allowed_origins = [
@@ -28,6 +33,34 @@ app = FastAPI(
     docs_url="/api/docs",           
     openapi_url="/api/openapi.json" 
 )
+
+notification_poll_task = None
+
+
+async def _notification_poll_loop() -> None:
+    interval = max(15, int(os.getenv("NOTIFICATION_POLL_SECONDS", "30")))
+    while True:
+        try:
+            await asyncio.to_thread(reconcile_pending_check_notifications)
+        except Exception:
+            # A temporary Core outage must not stop the next polling cycle.
+            pass
+        await asyncio.sleep(interval)
+
+
+@app.on_event("startup")
+async def start_notification_polling() -> None:
+    global notification_poll_task
+    notification_poll_task = asyncio.create_task(_notification_poll_loop())
+
+
+@app.on_event("shutdown")
+async def stop_notification_polling() -> None:
+    if notification_poll_task is None:
+        return
+    notification_poll_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await notification_poll_task
 
 if cors_allowed_origins or cors_allowed_origin_regex:
     allow_credentials = "*" not in cors_allowed_origins

@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 from typing import Any, Dict, Optional
@@ -102,6 +103,40 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def register(self, email: str, password: str) -> tuple[int, Any]:
+        self._ensure_configured()
+        normalized_email = email.strip().lower()
+        technical_username = (
+            "mobile_"
+            + hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()[:32]
+        )
+        try:
+            response = requests.post(
+                f"{self.base_url}/auth/register",
+                headers=self._headers(),
+                json={
+                    "email": normalized_email,
+                    "username": technical_username,
+                    "password1": password,
+                    "password2": password,
+                },
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Oysyn Core API unavailable: {exc}",
+            ) from exc
+
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            payload = {
+                "code": "registration_unavailable",
+                "message": "Сервис регистрации временно недоступен.",
+            }
+        return response.status_code, payload
+
     def confirm_qr(self, user_id: int, token: str) -> Any:
         response = self._request(
             "POST",
@@ -135,6 +170,12 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def get_me_statistics(self, user_id: int) -> Any:
+        response = self._request(
+            "GET", "/users/me/statistics", user_id=user_id
+        )
+        return self._json(response)
+
     def get_user_sessions(self, user_id: int) -> Any:
         response = self._request("GET", "/sessions/devices", user_id=user_id)
         return self._json(response)
@@ -159,11 +200,45 @@ class OysynCoreClient:
         response = self._request("GET", "/folders", user_id=user_id)
         return self._json(response)
 
+    def create_folder(self, user_id: int, payload: Dict[str, Any]) -> Any:
+        response = self._request(
+            "POST",
+            "/folders",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
+    def rename_folder(
+        self,
+        user_id: int,
+        folder_id: int,
+        payload: Dict[str, Any],
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/folders/{folder_id}",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
     def get_organization(self, user_id: int, organization_id: int) -> Any:
         response = self._request(
             "GET",
             f"/organizations/{organization_id}",
             user_id=user_id,
+        )
+        return self._json(response)
+
+    def update_organization(
+        self, user_id: int, organization_id: int, payload: Dict[str, Any]
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/organizations/{organization_id}",
+            user_id=user_id,
+            json=payload,
         )
         return self._json(response)
 
@@ -212,6 +287,38 @@ class OysynCoreClient:
             "GET",
             f"/organizations/{organization_id}/api_settings/",
             user_id=user_id,
+        )
+        return self._json(response)
+
+    def create_organization_api_setting(
+        self, user_id: int, organization_id: int, payload: Dict[str, Any]
+    ) -> Any:
+        response = self._request(
+            "POST",
+            f"/organizations/{organization_id}/api_settings/",
+            user_id=user_id,
+            json=payload,
+        )
+        return self._json(response)
+
+    def get_organization_thresholds(
+        self, user_id: int, organization_id: int
+    ) -> Any:
+        response = self._request(
+            "GET",
+            f"/organizations/{organization_id}/thresholds/",
+            user_id=user_id,
+        )
+        return self._json(response)
+
+    def update_organization_thresholds(
+        self, user_id: int, organization_id: int, payload: Dict[str, Any]
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/organizations/{organization_id}/thresholds/",
+            user_id=user_id,
+            json=payload,
         )
         return self._json(response)
 
@@ -307,8 +414,59 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def get_pair_checks(self, user_id: int, params: Dict[str, Any]) -> Any:
+        response = self._request(
+            "GET",
+            "/checks/pair_check/",
+            user_id=user_id,
+            params=params,
+        )
+        return self._json(response)
+
+    async def create_pair_check(
+        self,
+        user_id: int,
+        *,
+        first_document: UploadFile,
+        second_document: UploadFile,
+        form: Dict[str, Any],
+    ) -> Any:
+        first_bytes = await first_document.read()
+        second_bytes = await second_document.read()
+        files = {
+            "a_document": (
+                first_document.filename,
+                first_bytes,
+                first_document.content_type or "application/octet-stream",
+            ),
+            "b_document": (
+                second_document.filename,
+                second_bytes,
+                second_document.content_type or "application/octet-stream",
+            ),
+        }
+        response = self._request(
+            "POST",
+            "/checks/pair_check/",
+            user_id=user_id,
+            data=form,
+            files=files,
+        )
+        return self._json(response)
+
     def get_check(self, user_id: int, check_id: int) -> Any:
         response = self._request("GET", f"/checks/{check_id}", user_id=user_id)
+        return self._json(response)
+
+    def update_check_folder(
+        self, user_id: int, check_id: int, folder_id: Optional[int]
+    ) -> Any:
+        response = self._request(
+            "PATCH",
+            f"/checks/{check_id}",
+            user_id=user_id,
+            json={"folder_id": folder_id},
+        )
         return self._json(response)
 
     def delete_check(self, user_id: int, check_id: int) -> None:
