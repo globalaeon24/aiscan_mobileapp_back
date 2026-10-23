@@ -2,7 +2,10 @@ import hashlib
 import os
 import re
 import secrets
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -18,7 +21,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+import jwt
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
@@ -43,9 +46,14 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=F
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("JWT_ALGORITHM") or os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "360"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 QR_LOGIN_EXPIRE_SECONDS = int(os.getenv("QR_LOGIN_EXPIRE_SECONDS", "120"))
+JWT_ISSUER = "oysyn-mobile-backend"
+JWT_AUDIENCE = "oysyn-mobile-app"
+
+_rate_limit_lock = Lock()
+_rate_limit_events: Dict[tuple[str, str], deque[float]] = defaultdict(deque)
 
 ALLOWED_REPORT_TYPES = {
     "full_report",
@@ -119,6 +127,8 @@ class LoginRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("Поле обязательно")
+        if len(value) > 1024:
+            raise ValueError("Значение слишком длинное")
         return value
 
     @field_validator("device_id", "device_name", "device_model")
@@ -149,6 +159,8 @@ class RegistrationRequest(BaseModel):
     @classmethod
     def validate_email(cls, value: str) -> str:
         normalized = value.strip().lower()
+        if len(normalized) > 254:
+            raise ValueError("Email слишком длинный")
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized):
             raise ValueError("Введите корректный email")
         return normalized
@@ -158,6 +170,8 @@ class RegistrationRequest(BaseModel):
     def validate_password(cls, value: str) -> str:
         if len(value) < 8:
             raise ValueError("Пароль должен содержать не менее 8 символов")
+        if len(value) > 1024:
+            raise ValueError("Пароль слишком длинный")
         return value
 
     @field_validator("agreement_version")
@@ -193,6 +207,8 @@ class RefreshTokenRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("Поле обязательно")
+        if len(value) > 512:
+            raise ValueError("Некорректный токен")
         return value
 
 
@@ -278,6 +294,8 @@ class PushTokenPayload(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("Поле обязательно")
+        if len(normalized) > 4096:
+            raise ValueError("Значение слишком длинное")
         return normalized
 
 
@@ -315,7 +333,45 @@ def _credentials_exception() -> HTTPException:
     )
 
 
+def _enforce_rate_limit(
+    bucket: str,
+    identity: str,
+    *,
+    limit: int,
+    window_seconds: int,
+) -> None:
+    identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    key = (bucket, identity_hash)
+    now = time.monotonic()
+    cutoff = now - window_seconds
+    with _rate_limit_lock:
+        if len(_rate_limit_events) > 10000:
+            stale_keys = [
+                stale_key
+                for stale_key, stale_events in _rate_limit_events.items()
+                if not stale_events or stale_events[-1] <= cutoff
+            ]
+            for stale_key in stale_keys:
+                _rate_limit_events.pop(stale_key, None)
+        events = _rate_limit_events[key]
+        while events and events[0] <= cutoff:
+            events.popleft()
+        if len(events) >= limit:
+            retry_after = max(1, int(events[0] + window_seconds - now))
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Слишком много запросов. Повторите позже.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        events.append(now)
+
+
 def _ensure_secret_key() -> str:
+    if ALGORITHM != "HS256":
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="JWT_ALGORITHM must be HS256",
+        )
     if not SECRET_KEY or len(SECRET_KEY) < 32:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -331,7 +387,10 @@ def create_mobile_access_token(user_id: int, jti: Optional[str] = None) -> str:
     )
     payload = {
         "sub": str(user_id),
+        "iat": datetime.now(timezone.utc),
         "exp": expire,
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
         "scope": "mobile",
         "jti": jti or secrets.token_urlsafe(24),
     }
@@ -444,7 +503,6 @@ def _create_check_notification(
         payload={
             "check_id": check_id,
             "check_status": check_status,
-            "check": check,
             "route": f"/checks/{check_id}",
         },
         status="created",
@@ -817,7 +875,7 @@ def _cache_linked_device_sessions(
         session.first_seen_at = _parse_datetime(item.get("first_seen_at"))
         session.last_active_at = _parse_datetime(item.get("last_active_at"))
         session.revoked_at = _parse_datetime(item.get("revoked_at"))
-        session.raw_payload = item.get("raw")
+        session.raw_payload = None
         db.add(session)
     db.commit()
 
@@ -830,10 +888,17 @@ def get_mobile_user_id(
         raise _credentials_exception()
 
     try:
-        payload = jwt.decode(token, _ensure_secret_key(), algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            token,
+            _ensure_secret_key(),
+            algorithms=[ALGORITHM],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={"require": ["sub", "exp", "iss", "aud", "jti"]},
+        )
         user_id = payload.get("sub")
         jti = payload.get("jti")
-        if not user_id:
+        if not user_id or not jti:
             raise _credentials_exception()
         core_user_id = int(user_id)
         mobile_user = (
@@ -841,29 +906,25 @@ def get_mobile_user_id(
             .filter(MobileUser.core_user_id == str(core_user_id))
             .first()
         )
-        if mobile_user and jti:
-            jti_sessions = (
-                db.query(MobileSession)
-                .filter(
-                    MobileSession.mobile_user_id == mobile_user.id,
-                    MobileSession.access_token_jti.isnot(None),
-                )
-                .all()
+        if mobile_user is None or mobile_user.status != "active":
+            raise _credentials_exception()
+        session = (
+            db.query(MobileSession)
+            .filter(
+                MobileSession.mobile_user_id == mobile_user.id,
+                MobileSession.access_token_jti == str(jti),
             )
-            if jti_sessions:
-                session = next(
-                    (item for item in jti_sessions if item.access_token_jti == jti),
-                    None,
-                )
-                if (
-                    session is None
-                    or session.status != "active"
-                    or session.revoked_at is not None
-                    or _as_utc(session.expires_at) <= _now()
-                ):
-                    raise _credentials_exception()
+            .first()
+        )
+        if (
+            session is None
+            or session.status != "active"
+            or session.revoked_at is not None
+            or _as_utc(session.expires_at) <= _now()
+        ):
+            raise _credentials_exception()
         return core_user_id
-    except (JWTError, ValueError):
+    except (jwt.InvalidTokenError, ValueError):
         raise _credentials_exception()
 
 
@@ -874,6 +935,12 @@ def create_qr_login_session(
     db: Session = Depends(get_db),
 ) -> QrLoginCreateResponse:
     data = data or QrLoginCreateRequest()
+    _enforce_rate_limit(
+        "qr_create",
+        _client_ip(request) or "unknown",
+        limit=30,
+        window_seconds=60,
+    )
     qr_token = secrets.token_urlsafe(48)
     expires_at = _now() + timedelta(seconds=QR_LOGIN_EXPIRE_SECONDS)
     session = QrLoginSession(
@@ -1077,6 +1144,20 @@ def login(
     request: Request,
     db: Session = Depends(get_db),
 ) -> MobileToken:
+    client_ip = _client_ip(request) or "unknown"
+    normalized_email = data.email.strip().lower()
+    _enforce_rate_limit(
+        "login_ip",
+        client_ip,
+        limit=20,
+        window_seconds=300,
+    )
+    _enforce_rate_limit(
+        "login_account",
+        normalized_email,
+        limit=8,
+        window_seconds=300,
+    )
     core_response = oysyn_core_client.login(data.email, data.password)
     user = core_response.get("user") if isinstance(core_response, dict) else None
 
@@ -1149,6 +1230,20 @@ def register(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    client_ip = _client_ip(request) or "unknown"
+    normalized_email = data.email.strip().lower()
+    _enforce_rate_limit(
+        "register_ip",
+        client_ip,
+        limit=5,
+        window_seconds=600,
+    )
+    _enforce_rate_limit(
+        "register_account",
+        normalized_email,
+        limit=3,
+        window_seconds=600,
+    )
     if data.password != data.password_confirmation:
         raise HTTPException(status_code=422, detail="Пароли не совпадают")
     if not data.agreement_accepted:
@@ -1190,6 +1285,12 @@ def refresh_access_token(
     request: Request,
     db: Session = Depends(get_db),
 ) -> MobileToken:
+    _enforce_rate_limit(
+        "refresh",
+        _client_ip(request) or "unknown",
+        limit=30,
+        window_seconds=300,
+    )
     session = (
         db.query(MobileSession)
         .filter(MobileSession.refresh_token_hash == _hash_token(data.refresh_token))

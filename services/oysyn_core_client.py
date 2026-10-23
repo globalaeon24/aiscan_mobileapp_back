@@ -1,7 +1,9 @@
 import hashlib
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -34,6 +36,19 @@ class OysynCoreClient:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Oysyn Core API env variables are missing",
             )
+        parsed_url = urlparse(self.base_url)
+        environment = os.getenv("ENVIRONMENT", "development").strip().lower()
+        if environment == "production" and parsed_url.scheme != "https":
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Oysyn Core API must use HTTPS in production",
+            )
+        jwt_secret = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
+        if jwt_secret and self.secret == jwt_secret:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="JWT and Core API secrets must be different",
+            )
 
     def _headers(self, user_id: Optional[int] = None) -> Dict[str, str]:
         self._ensure_configured()
@@ -61,15 +76,26 @@ class OysynCoreClient:
                 **kwargs,
             )
         except requests.RequestException as exc:
+            logger.warning(
+                "Oysyn Core request failed: method=%s path=%s error=%s",
+                method,
+                path,
+                type(exc).__name__,
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Oysyn Core API unavailable: {exc}",
+                detail="Oysyn Core API is temporarily unavailable",
             ) from exc
 
         if response.status_code >= 400:
+            detail = (
+                self._extract_error(response)
+                if response.status_code < 500
+                else "Oysyn Core API is temporarily unavailable"
+            )
             raise HTTPException(
                 status_code=response.status_code,
-                detail=self._extract_error(response),
+                detail=detail,
             )
 
         return response
@@ -79,11 +105,17 @@ class OysynCoreClient:
         try:
             payload = response.json()
         except ValueError:
-            return response.text or "Oysyn Core API error"
+            return "Oysyn Core API rejected the request"
 
         if isinstance(payload, dict):
-            return payload.get("error") or payload.get("detail") or payload
-        return payload
+            value = (
+                payload.get("error")
+                or payload.get("detail")
+                or payload.get("message")
+            )
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:500]
+        return "Oysyn Core API rejected the request"
 
     @staticmethod
     def _json(response: requests.Response) -> Any:
@@ -145,14 +177,9 @@ class OysynCoreClient:
             json={"token": token},
         )
         payload = self._json(response)
-        masked_token = (
-            f"{token[:8]}...{token[-6:]}" if len(token) > 16 else "<short-token>"
-        )
         logger.info(
-            "Oysyn Core QR confirm succeeded: user_id=%s token=%s response=%s",
+            "Oysyn Core QR confirm succeeded: user_id=%s",
             user_id,
-            masked_token,
-            payload,
         )
         return payload
 
@@ -397,12 +424,12 @@ class OysynCoreClient:
         document: UploadFile,
         form: Dict[str, Any],
     ) -> Any:
-        document_bytes = await document.read()
+        filename, document_bytes, content_type = await self._read_upload(document)
         files = {
             "document": (
-                document.filename,
+                filename,
                 document_bytes,
-                document.content_type or "application/octet-stream",
+                content_type,
             )
         }
         response = self._request(
@@ -431,18 +458,18 @@ class OysynCoreClient:
         second_document: UploadFile,
         form: Dict[str, Any],
     ) -> Any:
-        first_bytes = await first_document.read()
-        second_bytes = await second_document.read()
+        first_name, first_bytes, first_type = await self._read_upload(first_document)
+        second_name, second_bytes, second_type = await self._read_upload(second_document)
         files = {
             "a_document": (
-                first_document.filename,
+                first_name,
                 first_bytes,
-                first_document.content_type or "application/octet-stream",
+                first_type,
             ),
             "b_document": (
-                second_document.filename,
+                second_name,
                 second_bytes,
-                second_document.content_type or "application/octet-stream",
+                second_type,
             ),
         }
         response = self._request(
@@ -453,6 +480,67 @@ class OysynCoreClient:
             files=files,
         )
         return self._json(response)
+
+    @staticmethod
+    async def _read_upload(document: UploadFile) -> tuple[str, bytes, str]:
+        max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+        filename = Path(document.filename or "").name
+        extension = Path(filename).suffix.lower()
+        allowed_extensions = {
+            ".pdf",
+            ".doc",
+            ".docx",
+            ".txt",
+            ".rtf",
+            ".pptx",
+            ".odt",
+        }
+        if not filename or extension not in allowed_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="Unsupported document format",
+            )
+
+        chunks = bytearray()
+        while True:
+            chunk = await document.read(64 * 1024)
+            if not chunk:
+                break
+            chunks.extend(chunk)
+            if len(chunks) > max_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail="Document exceeds the upload size limit",
+                )
+        if not chunks:
+            raise HTTPException(status_code=422, detail="Document is empty")
+
+        header = bytes(chunks[:16])
+        is_valid = {
+            ".pdf": header.startswith(b"%PDF-"),
+            ".doc": header.startswith(bytes.fromhex("D0CF11E0A1B11AE1")),
+            ".docx": header.startswith(b"PK"),
+            ".pptx": header.startswith(b"PK"),
+            ".odt": header.startswith(b"PK"),
+            ".rtf": header.lstrip().startswith(b"{\\rtf"),
+            ".txt": b"\x00" not in bytes(chunks[:4096]),
+        }[extension]
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="Document content does not match its extension",
+            )
+
+        content_types = {
+            ".pdf": "application/pdf",
+            ".doc": "application/msword",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".odt": "application/vnd.oasis.opendocument.text",
+            ".rtf": "application/rtf",
+            ".txt": "text/plain",
+        }
+        return filename, bytes(chunks), content_types[extension]
 
     def get_check(self, user_id: int, check_id: int) -> Any:
         response = self._request("GET", f"/checks/{check_id}", user_id=user_id)

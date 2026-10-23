@@ -4,6 +4,7 @@ from contextlib import suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,11 +31,13 @@ if environment == "stage" and not cors_allowed_origin_regex:
 app = FastAPI(
     title="Oysyn Mobile Backend",
     version="1.0.0",
-    docs_url="/api/docs",           
-    openapi_url="/api/openapi.json" 
+    docs_url=None if environment == "production" else "/api/docs",
+    openapi_url=None if environment == "production" else "/api/openapi.json",
 )
 
 notification_poll_task = None
+max_request_bytes = int(os.getenv("MAX_REQUEST_BYTES", str(55 * 1024 * 1024)))
+max_json_body_bytes = int(os.getenv("MAX_JSON_BODY_BYTES", str(1024 * 1024)))
 
 
 async def _notification_poll_loop() -> None:
@@ -89,3 +92,40 @@ def health():
 
 
 app.include_router(mobile_v1_router, prefix="/api/v1", tags=["mobile-v1"])
+
+
+@app.middleware("http")
+async def enforce_request_size(request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            size = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid Content-Length"},
+            )
+        content_type = request.headers.get("content-type", "").lower()
+        limit = (
+            max_request_bytes
+            if "multipart/form-data" in content_type
+            else max_json_body_bytes
+        )
+        if size > limit:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request is too large"},
+            )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=()"
+    )
+    return response
