@@ -24,6 +24,12 @@ env/
 id_rsa*
 id_ed25519*
 *@*
+*service-account*.json
+firebase-adminsdk*.json
+google-services.json
+GoogleService-Info.plist
+*.jks
+*.keystore
 !deploy/systemd/oysyn-mobile-backend@.service
 
 # OS/editor

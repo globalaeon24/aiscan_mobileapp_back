@@ -1,0 +1,5 @@
+Oysyn production integration smoke test
+
+This synthetic document contains no customer information and is used only to verify the mobile application upload and result pipeline. It describes a simple educational exercise in which a student compares two sources, writes an original summary, and cites the source of each factual statement. The exercise is intentionally generic so that no private records, unpublished research, or personal details are transmitted during the test.
+
+A reliable document-checking workflow should first accept the file, then show a processing state. Only after the analysis is complete should the application show similarity values, detailed sources, and downloadable reports. If the service is temporarily unavailable, the application should show a clear retryable error without presenting incomplete values as final results. This text is a technical sample for that workflow, not an academic submission.

@@ -56,6 +56,28 @@ class MobileUser(Base):
     )
 
 
+class RegistrationConsent(Base):
+    __tablename__ = "registration_consents"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False)
+    agreement_version = Column(String(64), nullable=False)
+    agreement_url = Column(String(512), nullable=False)
+    accepted_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    core_response_code = Column(String(64), nullable=False)
+
+    __table_args__ = (
+        Index("ix_registration_consents_email", "email"),
+        Index("ix_registration_consents_accepted_at", "accepted_at"),
+    )
+
+
 class MobileDevice(Base):
     __tablename__ = "mobile_devices"
 
