@@ -25,7 +25,7 @@ Backend:
 | `services/oysyn_core_client.py` | Service-to-service client в Oysyn Core |
 | `database.py` | SQLAlchemy engine/session |
 | `mobile_models.py` | Mobile infrastructure models |
-| `alembic/versions/*.py` | Migrations 001-005 |
+| `alembic/versions/*.py` | Migrations 001-007 |
 | `docs/mobile_backend_db_schema.md` | DB schema documentation |
 | `.env.example` | Env template |
 
@@ -83,3 +83,13 @@ Frontend repo содержит общий handoff и API docs:
 Backend DB schema:
 
 - `docs/mobile_backend_db_schema.md`
+
+Environment separation and deployment templates:
+
+- `docs/environments.md`
+- `.env.stage.example`
+- `.env.production.example`
+- `deploy/systemd/oysyn-mobile-backend@.service`
+- `deploy/nginx/api-mobile-stage.oysyn.asia.conf`
+- `deploy/nginx/api-mobile-production.conf.example`
+- `deploy/INITIAL_SERVER_SETUP.md`

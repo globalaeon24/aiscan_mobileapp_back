@@ -2,7 +2,10 @@ import hashlib
 import os
 import re
 import secrets
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -16,22 +19,26 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from pydantic import BaseModel, EmailStr, field_validator
+import jwt
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import SessionLocal, get_db
 from mobile_models import (
     LinkedDeviceSession,
-    MobileDevice,
+    MobileCheckRequest,
     MobileSession,
     MobileUser,
+    Notification,
+    PushToken,
     QrLoginEvent,
     QrLoginSession,
+    RegistrationConsent,
 )
 from services.oysyn_core_client import oysyn_core_client
+from services.push_service import deliver_notification
 
 router = APIRouter()
 
@@ -39,9 +46,14 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=F
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("JWT_ALGORITHM") or os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "360"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 QR_LOGIN_EXPIRE_SECONDS = int(os.getenv("QR_LOGIN_EXPIRE_SECONDS", "120"))
+JWT_ISSUER = "oysyn-mobile-backend"
+JWT_AUDIENCE = "oysyn-mobile-app"
+
+_rate_limit_lock = Lock()
+_rate_limit_events: Dict[tuple[str, str], deque[float]] = defaultdict(deque)
 
 ALLOWED_REPORT_TYPES = {
     "full_report",
@@ -49,6 +61,52 @@ ALLOWED_REPORT_TYPES = {
     "certificate",
     "ai_certificate",
 }
+
+
+@router.get("/app/version")
+def get_app_version(
+    platform: str = Query(pattern="^(android|ios)$"),
+):
+    prefix = "ANDROID" if platform == "android" else "IOS"
+    default_store_url = (
+        "https://play.google.com/store/apps/details?id=asia.oysyn.mobile"
+        if platform == "android"
+        else "https://apps.apple.com/kz/app/oysyn/id6810601982"
+    )
+    latest_version = os.getenv(f"APP_UPDATE_{prefix}_LATEST_VERSION", "1.0.8")
+    latest_build = int(os.getenv(f"APP_UPDATE_{prefix}_LATEST_BUILD", "14"))
+    minimum_supported_build = int(
+        os.getenv(f"APP_UPDATE_{prefix}_MINIMUM_SUPPORTED_BUILD", "0")
+    )
+    update_required = os.getenv(
+        f"APP_UPDATE_{prefix}_REQUIRED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    remind_after_hours = max(
+        1,
+        int(os.getenv("APP_UPDATE_REMIND_AFTER_HOURS", "24")),
+    )
+    store_url = os.getenv(f"APP_UPDATE_{prefix}_STORE_URL", default_store_url)
+    return {
+        "enabled": bool(store_url),
+        "latest_version": latest_version,
+        "latest_build": latest_build,
+        "minimum_supported_build": minimum_supported_build,
+        "update_required": update_required,
+        "remind_after_hours": remind_after_hours,
+        "title": os.getenv("APP_UPDATE_TITLE", "Доступна новая версия OySyn"),
+        "message": os.getenv(
+            "APP_UPDATE_MESSAGE",
+            "Мы улучшили стабильность приложения и работу с документами.",
+        ),
+        "store_url": store_url,
+    }
+
+
+def _truncate_optional(value: Optional[str], max_length: int) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized[:max_length] or None
 
 
 class LoginRequest(BaseModel):
@@ -69,7 +127,68 @@ class LoginRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("Поле обязательно")
+        if len(value) > 1024:
+            raise ValueError("Значение слишком длинное")
         return value
+
+    @field_validator("device_id", "device_name", "device_model")
+    @classmethod
+    def normalize_device_text(cls, value: Optional[str]) -> Optional[str]:
+        return _truncate_optional(value, 255)
+
+    @field_validator("platform", "push_provider")
+    @classmethod
+    def normalize_platform_text(cls, value: Optional[str]) -> Optional[str]:
+        return _truncate_optional(value, 32)
+
+    @field_validator("os_version", "app_version")
+    @classmethod
+    def normalize_version_text(cls, value: Optional[str]) -> Optional[str]:
+        return _truncate_optional(value, 64)
+
+
+class RegistrationRequest(BaseModel):
+    email: str
+    password: str
+    password_confirmation: str
+    agreement_accepted: bool
+    agreement_version: str
+    agreement_url: str
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) > 254:
+            raise ValueError("Email слишком длинный")
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized):
+            raise ValueError("Введите корректный email")
+        return normalized
+
+    @field_validator("password", "password_confirmation")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("Пароль должен содержать не менее 8 символов")
+        if len(value) > 1024:
+            raise ValueError("Пароль слишком длинный")
+        return value
+
+    @field_validator("agreement_version")
+    @classmethod
+    def validate_agreement_version(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or len(normalized) > 64:
+            raise ValueError("Некорректная версия соглашения")
+        return normalized
+
+    @field_validator("agreement_url")
+    @classmethod
+    def validate_agreement_url(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized != "https://oysyn.asia/ru/policy/":
+            raise ValueError("Некорректная ссылка на соглашение")
+        return normalized
 
 
 class MobileToken(BaseModel):
@@ -77,6 +196,20 @@ class MobileToken(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: dict
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+    @field_validator("refresh_token")
+    @classmethod
+    def validate_refresh_token(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Поле обязательно")
+        if len(value) > 512:
+            raise ValueError("Некорректный токен")
+        return value
 
 
 class OrganizationUserPayload(BaseModel):
@@ -94,12 +227,77 @@ class OrganizationBillingPayload(BaseModel):
     checks_available: int
 
 
+class OrganizationUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    city: Optional[str] = None
+    address: Optional[str] = None
+    description: Optional[str] = None
+
+    @field_validator("title", "city", "address", "description")
+    @classmethod
+    def normalize_text(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if value is not None else None
+
+
+class OrganizationApiTokenPayload(BaseModel):
+    name: str
+    user_id: int
+    use_organization_balance: bool = False
+    api_checks_available: int = 0
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Наименование обязательно")
+        return value
+
+
+class FolderPayload(BaseModel):
+    name: str
+    parent_folder: Optional[int] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Укажите название папки")
+        if len(value) > 512:
+            raise ValueError("Название папки не должно превышать 512 символов")
+        return value
+
+
+class CheckFolderPayload(BaseModel):
+    folder_id: Optional[int] = None
+
+
 class ProfileUpdatePayload(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     middle_name: Optional[str] = None
     phone_number: Optional[str] = None
     city: Optional[str] = None
+    notification: Optional[bool] = None
+
+
+class PushTokenPayload(BaseModel):
+    device_id: str
+    token: str
+    platform: str
+    provider: str = "fcm"
+
+    @field_validator("device_id", "token", "platform", "provider")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Поле обязательно")
+        if len(normalized) > 4096:
+            raise ValueError("Значение слишком длинное")
+        return normalized
+
 
 class QrLoginCreateRequest(BaseModel):
     web_session_id: Optional[str] = None
@@ -135,7 +333,45 @@ def _credentials_exception() -> HTTPException:
     )
 
 
+def _enforce_rate_limit(
+    bucket: str,
+    identity: str,
+    *,
+    limit: int,
+    window_seconds: int,
+) -> None:
+    identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    key = (bucket, identity_hash)
+    now = time.monotonic()
+    cutoff = now - window_seconds
+    with _rate_limit_lock:
+        if len(_rate_limit_events) > 10000:
+            stale_keys = [
+                stale_key
+                for stale_key, stale_events in _rate_limit_events.items()
+                if not stale_events or stale_events[-1] <= cutoff
+            ]
+            for stale_key in stale_keys:
+                _rate_limit_events.pop(stale_key, None)
+        events = _rate_limit_events[key]
+        while events and events[0] <= cutoff:
+            events.popleft()
+        if len(events) >= limit:
+            retry_after = max(1, int(events[0] + window_seconds - now))
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Слишком много запросов. Повторите позже.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        events.append(now)
+
+
 def _ensure_secret_key() -> str:
+    if ALGORITHM != "HS256":
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="JWT_ALGORITHM must be HS256",
+        )
     if not SECRET_KEY or len(SECRET_KEY) < 32:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -144,28 +380,201 @@ def _ensure_secret_key() -> str:
     return SECRET_KEY
 
 
-def create_mobile_access_token(
-    user_id: int,
-    session_id: Optional[int] = None,
-    jti: Optional[str] = None,
-) -> str:
+def create_mobile_access_token(user_id: int, jti: Optional[str] = None) -> str:
     secret_key = _ensure_secret_key()
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=ACCESS_TOKEN_EXPIRE_MINUTES
     )
     payload = {
         "sub": str(user_id),
+        "iat": datetime.now(timezone.utc),
         "exp": expire,
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
         "scope": "mobile",
         "jti": jti or secrets.token_urlsafe(24),
     }
-    if session_id is not None:
-        payload["sid"] = session_id
     return jwt.encode(payload, secret_key, algorithm=ALGORITHM)
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _notification_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _check_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("results", "items", "data"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def _sync_check_notifications(
+    db: Session,
+    mobile_user: MobileUser,
+    core_user_id: int,
+) -> None:
+    checks = _check_items(
+        oysyn_core_client.get_checks(
+            core_user_id,
+            {"page": 1, "page_size": 50},
+        )
+    )
+    recent_notifications = (
+        db.query(Notification)
+        .filter(
+            Notification.mobile_user_id == mobile_user.id,
+            Notification.notification_type.in_((
+                "check_completed",
+                "check_failed",
+            )),
+        )
+        .order_by(Notification.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    existing_check_ids = {
+        str((item.payload or {}).get("check_id"))
+        for item in recent_notifications
+        if (item.payload or {}).get("check_id") is not None
+    }
+    changed = False
+    for check in checks:
+        check_id = check.get("id")
+        check_status = str(check.get("status") or "").upper()
+        if check_id is None or check_status not in {"CH", "FA"}:
+            continue
+        if str(check_id) in existing_check_ids:
+            continue
+        _create_check_notification(db, mobile_user.id, check)
+        existing_check_ids.add(str(check_id))
+        changed = True
+    if changed:
+        db.commit()
+
+
+def _serialize_notification(item: Notification) -> Dict[str, Any]:
+    return {
+        "id": int(item.id),
+        "type": item.notification_type,
+        "title": item.title,
+        "body": item.body,
+        "payload": item.payload or {},
+        "status": item.status,
+        "priority": item.priority,
+        "created_at": item.created_at,
+        "read_at": item.read_at,
+        "is_read": item.read_at is not None,
+    }
+
+
+def _create_check_notification(
+    db: Session,
+    mobile_user_id: int,
+    check: Dict[str, Any],
+) -> Notification:
+    check_id = int(check["id"])
+    check_status = str(check.get("status") or "").upper()
+    title = str(
+        check.get("title") or check.get("file_name") or "Документ"
+    ).strip()
+    failed = check_status == "FA"
+    notification = Notification(
+        mobile_user_id=mobile_user_id,
+        notification_type="check_failed" if failed else "check_completed",
+        title=(
+            "Проверка завершилась с ошибкой"
+            if failed
+            else "Проверка завершена"
+        ),
+        body=title,
+        payload={
+            "check_id": check_id,
+            "check_status": check_status,
+            "route": f"/checks/{check_id}",
+        },
+        status="created",
+        priority="normal",
+    )
+    created_at = _notification_datetime(check.get("created_at"))
+    if created_at is not None:
+        notification.created_at = created_at
+    db.add(notification)
+    db.flush()
+    deliver_notification(db, notification)
+    return notification
+
+
+def reconcile_pending_check_notifications() -> int:
+    """Poll Core for checks submitted through this gateway."""
+    db = SessionLocal()
+    completed = 0
+    try:
+        pending = (
+            db.query(MobileCheckRequest)
+            .filter(
+                MobileCheckRequest.status.in_((
+                    "submitted",
+                    "processing",
+                )),
+                MobileCheckRequest.core_check_id.isnot(None),
+            )
+            .order_by(MobileCheckRequest.created_at.asc())
+            .limit(100)
+            .all()
+        )
+        for request_item in pending:
+            try:
+                core_user_id = int(request_item.core_user_id)
+                check_id = int(request_item.core_check_id)
+                check = oysyn_core_client.get_check(core_user_id, check_id)
+            except Exception:
+                continue
+            if not isinstance(check, dict):
+                continue
+            check_status = str(check.get("status") or "").upper()
+            if check_status not in {"CH", "FA"}:
+                request_item.status = "processing"
+                continue
+            existing = (
+                db.query(Notification)
+                .filter(
+                    Notification.mobile_user_id == request_item.mobile_user_id,
+                    Notification.payload["check_id"].astext == str(check_id),
+                )
+                .first()
+            )
+            if existing is None:
+                _create_check_notification(
+                    db,
+                    request_item.mobile_user_id,
+                    check,
+                )
+            request_item.status = "failed" if check_status == "FA" else "completed"
+            if check_status == "FA":
+                request_item.failed_at = _now()
+                request_item.error_message = str(
+                    check.get("status_display") or "Проверка завершилась с ошибкой"
+                )
+            else:
+                request_item.completed_at = _now()
+            completed += 1
+        db.commit()
+        return completed
+    finally:
+        db.close()
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -466,43 +875,9 @@ def _cache_linked_device_sessions(
         session.first_seen_at = _parse_datetime(item.get("first_seen_at"))
         session.last_active_at = _parse_datetime(item.get("last_active_at"))
         session.revoked_at = _parse_datetime(item.get("revoked_at"))
-        session.raw_payload = item.get("raw")
+        session.raw_payload = None
         db.add(session)
     db.commit()
-
-
-def _mobile_session_payload(
-    session: MobileSession,
-    device: Optional[MobileDevice],
-) -> Dict[str, Any]:
-    platform = (device.platform if device else None) or "mobile"
-    device_type = "tablet" if platform.lower() in {"ipad", "tablet"} else "mobile"
-    status_text = session.status
-    if status_text == "active" and _as_utc(session.expires_at) <= _now():
-        status_text = "expired"
-
-    return {
-        "id": -int(session.id),
-        "mobile_session_id": int(session.id),
-        "device_name": (
-            (device.device_name if device else None)
-            or (device.device_model if device else None)
-            or "Мобильное устройство"
-        ),
-        "browser": "OySyn",
-        "browser_version": device.app_version if device else None,
-        "platform": platform,
-        "os_version": device.os_version if device else None,
-        "device_type": device_type,
-        "location": None,
-        "ip_address": session.ip_address,
-        "user_agent": session.user_agent,
-        "status": status_text,
-        "first_seen_at": session.created_at,
-        "last_active_at": session.last_used_at,
-        "revoked_at": session.revoked_at,
-        "source": "mobile",
-    }
 
 
 def get_mobile_user_id(
@@ -513,38 +888,43 @@ def get_mobile_user_id(
         raise _credentials_exception()
 
     try:
-        payload = jwt.decode(token, _ensure_secret_key(), algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            token,
+            _ensure_secret_key(),
+            algorithms=[ALGORITHM],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={"require": ["sub", "exp", "iss", "aud", "jti"]},
+        )
         user_id = payload.get("sub")
-        if not user_id:
+        jti = payload.get("jti")
+        if not user_id or not jti:
             raise _credentials_exception()
-        session_id = payload.get("sid")
-        if session_id is not None:
-            mobile_user = (
-                db.query(MobileUser)
-                .filter(MobileUser.core_user_id == str(user_id))
-                .first()
+        core_user_id = int(user_id)
+        mobile_user = (
+            db.query(MobileUser)
+            .filter(MobileUser.core_user_id == str(core_user_id))
+            .first()
+        )
+        if mobile_user is None or mobile_user.status != "active":
+            raise _credentials_exception()
+        session = (
+            db.query(MobileSession)
+            .filter(
+                MobileSession.mobile_user_id == mobile_user.id,
+                MobileSession.access_token_jti == str(jti),
             )
-            session = (
-                db.query(MobileSession)
-                .filter(
-                    MobileSession.id == int(session_id),
-                    MobileSession.mobile_user_id == mobile_user.id,
-                )
-                .first()
-                if mobile_user
-                else None
-            )
-            if (
-                not session
-                or session.status != "active"
-                or session.revoked_at is not None
-                or _as_utc(session.expires_at) <= _now()
-            ):
-                raise _credentials_exception()
-            session.last_used_at = _now()
-            db.commit()
-        return int(user_id)
-    except (JWTError, ValueError):
+            .first()
+        )
+        if (
+            session is None
+            or session.status != "active"
+            or session.revoked_at is not None
+            or _as_utc(session.expires_at) <= _now()
+        ):
+            raise _credentials_exception()
+        return core_user_id
+    except (jwt.InvalidTokenError, ValueError):
         raise _credentials_exception()
 
 
@@ -555,6 +935,12 @@ def create_qr_login_session(
     db: Session = Depends(get_db),
 ) -> QrLoginCreateResponse:
     data = data or QrLoginCreateRequest()
+    _enforce_rate_limit(
+        "qr_create",
+        _client_ip(request) or "unknown",
+        limit=30,
+        window_seconds=60,
+    )
     qr_token = secrets.token_urlsafe(48)
     expires_at = _now() + timedelta(seconds=QR_LOGIN_EXPIRE_SECONDS)
     session = QrLoginSession(
@@ -758,6 +1144,20 @@ def login(
     request: Request,
     db: Session = Depends(get_db),
 ) -> MobileToken:
+    client_ip = _client_ip(request) or "unknown"
+    normalized_email = data.email.strip().lower()
+    _enforce_rate_limit(
+        "login_ip",
+        client_ip,
+        limit=20,
+        window_seconds=300,
+    )
+    _enforce_rate_limit(
+        "login_account",
+        normalized_email,
+        limit=8,
+        window_seconds=300,
+    )
     core_response = oysyn_core_client.login(data.email, data.password)
     user = core_response.get("user") if isinstance(core_response, dict) else None
 
@@ -767,40 +1167,18 @@ def login(
             detail="Oysyn Core API returned login response without user id",
         )
 
+    access_token_jti = secrets.token_urlsafe(24)
+    access_token = create_mobile_access_token(
+        int(user["id"]),
+        jti=access_token_jti,
+    )
     refresh_token = secrets.token_urlsafe(48)
     mobile_user = _get_or_create_mobile_user(db, int(user["id"]))
     _sync_mobile_user_snapshot(mobile_user, user)
-    device_id = data.device_id or f"mobile:{secrets.token_urlsafe(12)}"
-    device = (
-        db.query(MobileDevice)
-        .filter(
-            MobileDevice.mobile_user_id == mobile_user.id,
-            MobileDevice.device_id == device_id,
-        )
-        .first()
-    )
-    if not device:
-        device = MobileDevice(
-            mobile_user_id=mobile_user.id,
-            device_id=device_id,
-            platform=data.platform or "mobile",
-        )
-    device.platform = data.platform or device.platform or "mobile"
-    device.device_name = data.device_name or device.device_name
-    device.device_model = data.device_model or device.device_model
-    device.os_version = data.os_version or device.os_version
-    device.app_version = data.app_version or device.app_version
-    device.push_token = data.push_token or device.push_token
-    device.push_provider = data.push_provider or device.push_provider
-    device.is_active = True
-    device.last_seen_at = _now()
-    device.revoked_at = None
-    db.add(device)
 
-    access_token_jti = secrets.token_urlsafe(24)
     mobile_session = MobileSession(
         mobile_user_id=mobile_user.id,
-        device_id=device_id,
+        device_id=data.device_id or f"mobile:{secrets.token_urlsafe(12)}",
         access_token_jti=access_token_jti,
         refresh_token_hash=_hash_token(refresh_token),
         ip_address=_client_ip(request),
@@ -811,15 +1189,165 @@ def login(
     )
     db.add(mobile_session)
     db.flush()
-    access_token = create_mobile_access_token(
-        int(user["id"]),
-        session_id=mobile_session.id,
-        jti=access_token_jti,
+    platform = (data.platform or "").lower()
+    device_type = (
+        "tablet" if platform in {"ipad", "tablet"}
+        else "mobile" if platform in {"android", "ios"}
+        else "desktop"
+    )
+    db.add(
+        LinkedDeviceSession(
+            mobile_user_id=mobile_user.id,
+            core_session_id=f"mobile:{mobile_session.id}",
+            device_name=data.device_name or "Мобильное приложение OySyn",
+            platform=data.platform,
+            os_version=data.os_version,
+            device_type=device_type,
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+            status="active",
+            first_seen_at=_now(),
+            last_active_at=_now(),
+            raw_payload={
+                "device_model": data.device_model,
+                "app_version": data.app_version,
+                "source": "mobile",
+            },
+        )
     )
     db.commit()
 
     return MobileToken(
         access_token=access_token,
+        refresh_token=refresh_token,
+        user=user,
+    )
+
+
+@router.post("/auth/register")
+def register(
+    data: RegistrationRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    client_ip = _client_ip(request) or "unknown"
+    normalized_email = data.email.strip().lower()
+    _enforce_rate_limit(
+        "register_ip",
+        client_ip,
+        limit=5,
+        window_seconds=600,
+    )
+    _enforce_rate_limit(
+        "register_account",
+        normalized_email,
+        limit=3,
+        window_seconds=600,
+    )
+    if data.password != data.password_confirmation:
+        raise HTTPException(status_code=422, detail="Пароли не совпадают")
+    if not data.agreement_accepted:
+        raise HTTPException(
+            status_code=422,
+            detail="Необходимо принять Пользовательское соглашение",
+        )
+
+    core_status, core_payload = oysyn_core_client.register(
+        data.email,
+        data.password,
+    )
+    if not isinstance(core_payload, dict):
+        core_payload = {
+            "code": "registration_unavailable",
+            "message": "Сервис регистрации временно недоступен.",
+        }
+
+    code = str(core_payload.get("code") or "")
+    if code == "registration_created":
+        db.add(
+            RegistrationConsent(
+                email=data.email,
+                agreement_version=data.agreement_version,
+                agreement_url=data.agreement_url,
+                ip_address=_client_ip(request),
+                user_agent=_user_agent(request),
+                core_response_code=code,
+            )
+        )
+        db.commit()
+
+    return JSONResponse(status_code=core_status, content=core_payload)
+
+
+@router.post("/auth/refresh", response_model=MobileToken)
+def refresh_access_token(
+    data: RefreshTokenRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> MobileToken:
+    _enforce_rate_limit(
+        "refresh",
+        _client_ip(request) or "unknown",
+        limit=30,
+        window_seconds=300,
+    )
+    session = (
+        db.query(MobileSession)
+        .filter(MobileSession.refresh_token_hash == _hash_token(data.refresh_token))
+        .first()
+    )
+    if (
+        not session
+        or session.status != "active"
+        or session.revoked_at is not None
+        or _as_utc(session.expires_at) <= _now()
+    ):
+        raise _credentials_exception()
+
+    mobile_user = session.mobile_user
+    if not mobile_user or not mobile_user.core_user_id:
+        raise _credentials_exception()
+
+    try:
+        core_user_id = int(mobile_user.core_user_id)
+    except (TypeError, ValueError):
+        raise _credentials_exception()
+
+    user = oysyn_core_client.get_me(core_user_id)
+    if not isinstance(user, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Oysyn Core API returned invalid user data",
+        )
+
+    refresh_token = secrets.token_urlsafe(48)
+    access_token_jti = secrets.token_urlsafe(24)
+    session.refresh_token_hash = _hash_token(refresh_token)
+    session.access_token_jti = access_token_jti
+    session.last_used_at = _now()
+    session.ip_address = _client_ip(request)
+    session.user_agent = _user_agent(request)
+    _sync_mobile_user_snapshot(mobile_user, user)
+    linked_session = (
+        db.query(LinkedDeviceSession)
+        .filter(
+            LinkedDeviceSession.mobile_user_id == mobile_user.id,
+            LinkedDeviceSession.core_session_id == f"mobile:{session.id}",
+        )
+        .first()
+    )
+    if linked_session:
+        linked_session.last_active_at = _now()
+        linked_session.ip_address = _client_ip(request)
+        linked_session.user_agent = _user_agent(request)
+        linked_session.status = "active"
+    db.commit()
+
+    return MobileToken(
+        access_token=create_mobile_access_token(
+            core_user_id,
+            jti=access_token_jti,
+        ),
         refresh_token=refresh_token,
         user=user,
     )
@@ -835,6 +1363,11 @@ def get_me(user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.get_me(user_id)
 
 
+@router.get("/me/statistics")
+def get_me_statistics(user_id: int = Depends(get_mobile_user_id)):
+    return oysyn_core_client.get_me_statistics(user_id)
+
+
 @router.patch("/me")
 def update_me(
     payload: ProfileUpdatePayload,
@@ -845,36 +1378,161 @@ def update_me(
         payload.model_dump(exclude_none=True),
     )
 
+
+@router.get("/notifications")
+def get_notifications(
+    limit: int = Query(default=30, ge=1, le=100),
+    user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
+):
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    _sync_check_notifications(db, mobile_user, user_id)
+    items = (
+        db.query(Notification)
+        .filter(
+            Notification.mobile_user_id == mobile_user.id,
+            Notification.archived_at.is_(None),
+        )
+        .order_by(Notification.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "items": [_serialize_notification(item) for item in items],
+        "unread_count": sum(item.read_at is None for item in items),
+    }
+
+
+@router.post("/notifications/read")
+def mark_notifications_read(
+    user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
+):
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    read_at = _now()
+    updated = (
+        db.query(Notification)
+        .filter(
+            Notification.mobile_user_id == mobile_user.id,
+            Notification.read_at.is_(None),
+            Notification.archived_at.is_(None),
+        )
+        .update(
+            {
+                Notification.read_at: read_at,
+                Notification.status: "read",
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return {"status": "ok", "updated": updated, "read_at": read_at}
+
+
+@router.post("/devices/push-token")
+def register_push_token(
+    payload: PushTokenPayload,
+    user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
+):
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    token = (
+        db.query(PushToken)
+        .filter(
+            PushToken.mobile_user_id == mobile_user.id,
+            PushToken.device_id == payload.device_id,
+        )
+        .first()
+    )
+    if token is None:
+        token = PushToken(
+            mobile_user_id=mobile_user.id,
+            device_id=payload.device_id,
+            provider=payload.provider,
+            token=payload.token,
+            platform=payload.platform,
+        )
+    else:
+        token.provider = payload.provider
+        token.token = payload.token
+        token.platform = payload.platform
+        token.is_active = True
+        token.revoked_at = None
+    token.last_used_at = _now()
+    db.add(token)
+    db.commit()
+    return {"status": "ok"}
+
+
 @router.get("/sessions/devices")
 def get_linked_device_sessions(
     user_id: int = Depends(get_mobile_user_id),
     db: Session = Depends(get_db),
 ):
-    mobile_user = _get_or_create_mobile_user(db, user_id)
-    try:
-        core_response = oysyn_core_client.get_user_sessions(user_id)
-        core_sessions = [
-            _normalize_linked_device_session(item)
-            for item in _extract_session_items(core_response)
-        ]
-        _cache_linked_device_sessions(db, mobile_user.id, core_sessions)
-    except HTTPException:
-        core_sessions = []
-
-    devices = {
-        device.device_id: device
-        for device in db.query(MobileDevice)
-        .filter(MobileDevice.mobile_user_id == mobile_user.id)
-        .all()
-    }
-    mobile_sessions = [
-        _mobile_session_payload(session, devices.get(session.device_id))
-        for session in db.query(MobileSession)
-        .filter(MobileSession.mobile_user_id == mobile_user.id)
-        .order_by(MobileSession.created_at.desc())
-        .all()
+    core_response = oysyn_core_client.get_user_sessions(user_id)
+    sessions = [
+        _normalize_linked_device_session(item)
+        for item in _extract_session_items(core_response)
     ]
-    return {"items": mobile_sessions + core_sessions}
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    _cache_linked_device_sessions(db, mobile_user.id, sessions)
+    mobile_sessions = (
+        db.query(MobileSession)
+        .filter(
+            MobileSession.mobile_user_id == mobile_user.id,
+            MobileSession.status == "active",
+            MobileSession.revoked_at.is_(None),
+            MobileSession.expires_at > _now(),
+        )
+        .order_by(MobileSession.last_used_at.desc())
+        .all()
+    )
+    for mobile_session in mobile_sessions:
+        linked = (
+            db.query(LinkedDeviceSession)
+            .filter(
+                LinkedDeviceSession.mobile_user_id == mobile_user.id,
+                LinkedDeviceSession.core_session_id
+                == f"mobile:{mobile_session.id}",
+            )
+            .first()
+        )
+        parsed_agent = _parse_user_agent(mobile_session.user_agent)
+        sessions.append({
+            "id": -int(mobile_session.id),
+            "mobile_session_id": int(mobile_session.id),
+            "source": "mobile",
+            "device_name": (
+                linked.device_name if linked and linked.device_name
+                else "Мобильное приложение OySyn"
+            ),
+            "browser": parsed_agent["browser"],
+            "browser_version": parsed_agent["browser_version"],
+            "platform": (
+                linked.platform if linked and linked.platform
+                else parsed_agent["platform"]
+            ),
+            "os_version": (
+                linked.os_version if linked and linked.os_version
+                else parsed_agent["os_version"]
+            ),
+            "device_type": (
+                linked.device_type if linked and linked.device_type
+                else parsed_agent["device_type"]
+            ),
+            "ip_address": mobile_session.ip_address,
+            "user_agent": mobile_session.user_agent,
+            "status": "active",
+            "first_seen_at": mobile_session.created_at,
+            "last_active_at": mobile_session.last_used_at,
+            "revoked_at": None,
+        })
+    sessions.sort(
+        key=lambda item: _parse_datetime(item.get("last_active_at"))
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return {"items": sessions}
 
 
 @router.post("/sessions/devices/{session_id}/revoke")
@@ -883,37 +1541,40 @@ def revoke_linked_device_session(
     user_id: int = Depends(get_mobile_user_id),
     db: Session = Depends(get_db),
 ):
-    mobile_user = _get_or_create_mobile_user(db, user_id)
     if session_id < 0:
-        mobile_session = (
+        mobile_user = _get_or_create_mobile_user(db, user_id)
+        mobile_session_id = -session_id
+        session = (
             db.query(MobileSession)
             .filter(
-                MobileSession.id == -session_id,
+                MobileSession.id == mobile_session_id,
                 MobileSession.mobile_user_id == mobile_user.id,
             )
             .first()
         )
-        if not mobile_session:
+        if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
-        mobile_session.status = "revoked"
-        mobile_session.revoked_at = _now()
-        mobile_session.revoked_by_user_id = mobile_user.id
-        mobile_session.revocation_reason = "Revoked by user"
-        device = (
-            db.query(MobileDevice)
+        session.status = "revoked"
+        session.revoked_at = _now()
+        session.revoked_by_user_id = mobile_user.id
+        session.revocation_reason = "revoked_by_user"
+        linked = (
+            db.query(LinkedDeviceSession)
             .filter(
-                MobileDevice.mobile_user_id == mobile_user.id,
-                MobileDevice.device_id == mobile_session.device_id,
+                LinkedDeviceSession.mobile_user_id == mobile_user.id,
+                LinkedDeviceSession.core_session_id
+                == f"mobile:{mobile_session_id}",
             )
             .first()
         )
-        if device:
-            device.is_active = False
-            device.revoked_at = _now()
+        if linked:
+            linked.status = "revoked"
+            linked.revoked_at = _now()
         db.commit()
-        return {"status": "revoked", "session_id": session_id, "source": "mobile"}
+        return {"status": "ok"}
 
     core_response = oysyn_core_client.revoke_user_session(user_id, session_id)
+    mobile_user = _get_or_create_mobile_user(db, user_id)
     session = (
         db.query(LinkedDeviceSession)
         .filter(
@@ -941,6 +1602,25 @@ def get_organization(
     user_id: int = Depends(get_mobile_user_id),
 ):
     return oysyn_core_client.get_organization(user_id, organization_id)
+
+
+@router.patch("/organizations/{organization_id}")
+def update_organization(
+    organization_id: int,
+    payload: OrganizationUpdatePayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    values = payload.model_dump(exclude_none=True)
+    if not values:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Не переданы данные для обновления организации",
+        )
+    return oysyn_core_client.update_organization(
+        user_id,
+        organization_id,
+        values,
+    )
 
 
 @router.get("/organizations")
@@ -994,6 +1674,45 @@ def get_organization_api_settings(
     )
 
 
+@router.post("/organizations/{organization_id}/api-settings", status_code=201)
+def create_organization_api_setting(
+    organization_id: int,
+    payload: OrganizationApiTokenPayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.create_organization_api_setting(
+        user_id,
+        organization_id,
+        payload.model_dump(),
+    )
+
+
+@router.get("/organizations/{organization_id}/thresholds")
+def get_organization_thresholds(
+    organization_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_thresholds(user_id, organization_id)
+
+
+@router.patch("/organizations/{organization_id}/thresholds")
+def update_organization_thresholds(
+    organization_id: int,
+    payload: Dict[str, float],
+    user_id: int = Depends(get_mobile_user_id),
+):
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Не переданы пороговые значения",
+        )
+    return oysyn_core_client.update_organization_thresholds(
+        user_id,
+        organization_id,
+        payload,
+    )
+
+
 @router.get("/organizations/{organization_id}/billing")
 def get_organization_billing(
     organization_id: int,
@@ -1035,6 +1754,33 @@ def get_organization_reports(
     return oysyn_core_client.get_organization_reports(user_id, organization_id)
 
 
+@router.get("/organizations/{organization_id}/checks/deleted")
+def get_organization_deleted_checks(
+    organization_id: int,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_organization_deleted_checks(
+        user_id,
+        organization_id,
+        {"page": page, "page_size": page_size},
+    )
+
+
+@router.post("/organizations/{organization_id}/checks/{check_id}/restore")
+def restore_organization_check(
+    organization_id: int,
+    check_id: int,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.restore_organization_check(
+        user_id,
+        organization_id,
+        check_id,
+    )
+
+
 @router.get("/checks")
 def get_checks(
     status_filter: Optional[str] = Query(default=None, alias="status"),
@@ -1056,9 +1802,68 @@ def get_folders(user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.get_folders(user_id)
 
 
+@router.post("/folders", status_code=status.HTTP_201_CREATED)
+def create_folder(
+    payload: FolderPayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.create_folder(
+        user_id,
+        payload.model_dump(exclude_none=True),
+    )
+
+
+@router.patch("/folders/{folder_id}")
+def rename_folder(
+    folder_id: int,
+    payload: FolderPayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.rename_folder(
+        user_id,
+        folder_id,
+        {"name": payload.name},
+    )
+
+
 @router.get("/checks/modules")
 def get_check_modules(user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.get_check_modules(user_id)
+
+
+@router.get("/checks/pair-checks")
+def get_pair_checks(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.get_pair_checks(
+        user_id,
+        {"page": page, "page_size": page_size},
+    )
+
+
+@router.post("/checks/pair-checks", status_code=status.HTTP_201_CREATED)
+async def create_pair_check(
+    a_title: str = Form(...),
+    b_title: str = Form(...),
+    a_author: str = Form(...),
+    b_author: str = Form(...),
+    a_document: UploadFile = File(...),
+    b_document: UploadFile = File(...),
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return await oysyn_core_client.create_pair_check(
+        user_id,
+        first_document=a_document,
+        second_document=b_document,
+        form={
+            "a_title": a_title,
+            "b_title": b_title,
+            "a_author": a_author,
+            "b_author": b_author,
+        },
+    )
 
 
 @router.post("/checks", status_code=status.HTTP_201_CREATED)
@@ -1074,6 +1879,7 @@ async def create_check(
     modules: Optional[str] = Form(default=None),
     modules_kz: Optional[str] = Form(default=None),
     user_id: int = Depends(get_mobile_user_id),
+    db: Session = Depends(get_db),
 ):
     user = oysyn_core_client.get_me(user_id)
     try:
@@ -1104,16 +1910,84 @@ async def create_check(
     }
     form.update({key: value for key, value in optional_values.items() if value})
 
-    return await oysyn_core_client.create_check(
-        user_id,
-        document=document,
-        form=form,
+    mobile_user = _get_or_create_mobile_user(db, user_id)
+    request_item = MobileCheckRequest(
+        mobile_user_id=mobile_user.id,
+        core_user_id=str(user_id),
+        core_organization_id=(
+            str(user.get("organization_id"))
+            if user.get("organization_id") is not None
+            else None
+        ),
+        source="mobile",
+        status="submitting",
+        title=title,
+        document_name=document.filename,
+        document_type=document_type,
     )
+    db.add(request_item)
+    db.commit()
+    db.refresh(request_item)
+    try:
+        result = await oysyn_core_client.create_check(
+            user_id,
+            document=document,
+            form=form,
+        )
+    except Exception as exc:
+        request_item.status = "failed"
+        request_item.failed_at = _now()
+        request_item.error_message = str(exc)[:1000]
+        db.commit()
+        raise
+
+    if isinstance(result, dict):
+        check_id = result.get("id") or result.get("core_check_id")
+        request_item.core_check_id = str(check_id) if check_id is not None else None
+        request_item.status = "submitted"
+        request_item.submitted_at = _now()
+        check_status = str(result.get("status") or "").upper()
+        if check_status in {"CH", "FA"} and check_id is not None:
+            _create_check_notification(db, mobile_user.id, result)
+            request_item.status = "failed" if check_status == "FA" else "completed"
+            if check_status == "FA":
+                request_item.failed_at = _now()
+            else:
+                request_item.completed_at = _now()
+    db.commit()
+    return result
 
 
 @router.get("/checks/{check_id}")
 def get_check(check_id: int, user_id: int = Depends(get_mobile_user_id)):
     return oysyn_core_client.get_check(user_id, check_id)
+
+
+@router.patch("/checks/{check_id}")
+def update_check_folder(
+    check_id: int,
+    payload: CheckFolderPayload,
+    user_id: int = Depends(get_mobile_user_id),
+):
+    return oysyn_core_client.update_check_folder(
+        user_id,
+        check_id,
+        payload.folder_id,
+    )
+
+
+@router.delete("/checks/{check_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_check(check_id: int, user_id: int = Depends(get_mobile_user_id)):
+    try:
+        oysyn_core_client.delete_check(user_id, check_id)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_405_METHOD_NOT_ALLOWED:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="Удаление документов пока не поддерживается Oysyn Core API",
+            ) from exc
+        raise
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/checks/{check_id}/report")
