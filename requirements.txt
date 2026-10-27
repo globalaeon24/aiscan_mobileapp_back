@@ -9,4 +9,4 @@ PyJWT[crypto]==2.15.1
 python-multipart==0.0.32
 requests==2.34.2
 SQLAlchemy==2.0.54
-uvicorn==0.53.0
+uvicorn==0.54.0
