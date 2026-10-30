@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -41,6 +42,7 @@ from services.oysyn_core_client import oysyn_core_client
 from services.push_service import deliver_notification
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
@@ -61,6 +63,7 @@ ALLOWED_REPORT_TYPES = {
     "certificate",
     "ai_certificate",
 }
+ALLOWED_PAIR_REPORT_TYPES = {"full", "short"}
 
 
 @router.get("/app/version")
@@ -1386,7 +1389,15 @@ def get_notifications(
     db: Session = Depends(get_db),
 ):
     mobile_user = _get_or_create_mobile_user(db, user_id)
-    _sync_check_notifications(db, mobile_user, user_id)
+    try:
+        _sync_check_notifications(db, mobile_user, user_id)
+    except Exception as exc:
+        logger.warning(
+            "Notification sync skipped: core_user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+        db.rollback()
     items = (
         db.query(Notification)
         .filter(
@@ -1863,6 +1874,37 @@ async def create_pair_check(
             "a_author": a_author,
             "b_author": b_author,
         },
+    )
+
+
+@router.get("/checks/pair-checks/{pair_check_id}/report/pdf/{report_type}")
+def get_pair_report_pdf(
+    pair_check_id: int,
+    report_type: str,
+    lang: str = Query(default="ru", pattern="^(kk|ru|en)$"),
+    user_id: int = Depends(get_mobile_user_id),
+):
+    if report_type not in ALLOWED_PAIR_REPORT_TYPES:
+        raise HTTPException(status_code=404, detail="Тип отчета не найден")
+
+    upstream_response = oysyn_core_client.get_pair_report_pdf(
+        user_id,
+        pair_check_id,
+        report_type,
+        {"lang": lang},
+    )
+    headers = {}
+    content_disposition = upstream_response.headers.get("content-disposition")
+    if content_disposition:
+        headers["Content-Disposition"] = content_disposition
+
+    return Response(
+        content=upstream_response.content,
+        media_type=upstream_response.headers.get(
+            "content-type",
+            "application/pdf",
+        ),
+        headers=headers,
     )
 
 

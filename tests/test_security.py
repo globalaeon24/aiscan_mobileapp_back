@@ -32,6 +32,35 @@ class _Database:
         return _Query(next(self.results))
 
 
+class _NotificationQuery:
+    def __init__(self, items):
+        self.items = items
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def order_by(self, *args, **kwargs):
+        return self
+
+    def limit(self, *args, **kwargs):
+        return self
+
+    def all(self):
+        return self.items
+
+
+class _NotificationDatabase:
+    def __init__(self, items):
+        self.items = items
+        self.rolled_back = False
+
+    def query(self, model):
+        return _NotificationQuery(self.items)
+
+    def rollback(self):
+        self.rolled_back = True
+
+
 def test_access_token_requires_matching_active_session(monkeypatch):
     monkeypatch.setattr(mobile_routes, "SECRET_KEY", "s" * 64)
     token = mobile_routes.create_mobile_access_token(42, jti="known-jti")
@@ -98,3 +127,35 @@ def test_rate_limit_returns_retry_after():
 
     assert error.value.status_code == 429
     assert int(error.value.headers["Retry-After"]) > 0
+
+
+def test_notifications_remain_available_when_core_sync_fails(monkeypatch):
+    mobile_user = SimpleNamespace(id=7)
+    notification = SimpleNamespace(
+        id=11,
+        notification_type="check_completed",
+        title="Проверка завершена",
+        body="Документ",
+        payload={"check_id": 55},
+        status="created",
+        priority="normal",
+        created_at=datetime.now(timezone.utc),
+        read_at=None,
+    )
+    db = _NotificationDatabase([notification])
+    monkeypatch.setattr(
+        mobile_routes,
+        "_get_or_create_mobile_user",
+        lambda *_: mobile_user,
+    )
+
+    def fail_sync(*_):
+        raise HTTPException(status_code=503, detail="Core unavailable")
+
+    monkeypatch.setattr(mobile_routes, "_sync_check_notifications", fail_sync)
+
+    result = mobile_routes.get_notifications(limit=30, user_id=42, db=db)
+
+    assert db.rolled_back is True
+    assert result["unread_count"] == 1
+    assert result["items"][0]["id"] == 11

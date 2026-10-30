@@ -481,6 +481,20 @@ class OysynCoreClient:
         )
         return self._json(response)
 
+    def get_pair_report_pdf(
+        self,
+        user_id: int,
+        pair_check_id: int,
+        report_type: str,
+        params: Dict[str, Any],
+    ) -> requests.Response:
+        return self._request(
+            "GET",
+            f"/checks/pair_check/{pair_check_id}/report/pdf/{report_type}/",
+            user_id=user_id,
+            params=params,
+        )
+
     @staticmethod
     async def _read_upload(document: UploadFile) -> tuple[str, bytes, str]:
         max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
